@@ -10,11 +10,13 @@ EMA High/Low Alert Bot — BTC-USDT-SWAP (5m / 4h) — OKX
     Сигнал: close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
     len = 2400 для 5m, 200 для 4h.
 
-Данные тянутся через /api/v5/market/history-candles с пагинацией,
-чтобы EMA(2400) на 5m считалась честно, а не по 300 свечам.
+Свечи кэшируются в state.json: при повторном запуске тянем только новые.
+Так 5m-прогон после первого раза занимает <1 сек вместо ~22 сек.
 
-Запускается внешним триггером (cron-job.org -> workflow_dispatch).
-Дедуп по свече — через state.json (кэшируется между запусками Actions).
+Что обрабатывать — задаётся переменной окружения TF_FILTER
+(например "5m" или "4h"). Если не задана — обрабатываются оба ТФ.
+
+Дедуп по свече — через state.json.
 
 Секреты (Settings -> Secrets and variables -> Actions):
   EMAIL_TO, EMAIL_USER, EMAIL_APP_PASSWORD
@@ -40,28 +42,32 @@ STATE_PATH = BASE_DIR / "state.json"
 TICKER = "BTC-USDT-SWAP"
 EMA_TYPE = "EMA"
 
+# ============================================================
+#  ПАРЫ: таймфрейм -> длина EMA
+#  Здесь же добавляй новые пары, если захочешь.
+# ============================================================
 TF_LEN = {
-    "5m": 2400,
-    "4h": 200,
+    "5m":  2400,
+    "4h":  200,
+    # "15m": 800,   # пример: раскомментируй и настрой под себя
+    # "1h":  400,
 }
 
 TF_TO_OKX_BAR = {
-    "5m": "5m",
-    "4h": "4H",
+    "5m":  "5m",
+    "4h":  "4H",
+    "15m": "15m",
+    "1h":  "1H",
+    # "1d": "1D",
 }
 
-# Множитель запаса: сколько свечей тянем относительно длины EMA.
-# Нужен, чтобы EMA "разогрелась" и последние значения совпадали с TradingView.
-WARMUP_FACTOR = 3
+WARMUP_FACTOR = 3          # сколько свечей тянем сверх длины EMA (для разогрева)
+PAGE_LIMIT = 100           # лимит OKX history-candles за 1 запрос
+MAX_PAGES = 200            # защита от бесконечного цикла
+SLEEP_BETWEEN_PAGES = 0.12 # пауза между запросами, OKX rate limit
 
-# OKX history-candles: лимит одной страницы
-PAGE_LIMIT = 100
-
-# Максимум страниц на всякий случай (защита от бесконечного цикла)
-MAX_PAGES = 100
-
-# Пауза между запросами (OKX rate limit: 20 req / 2 sec на history-candles)
-SLEEP_BETWEEN_PAGES = 0.12
+# Сколько свечей хранить в state.json (len * WARMUP_FACTOR + запас)
+KEEP_EXTRA = 200
 
 
 def log(msg: str) -> None:
@@ -86,9 +92,11 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(state, ensure_ascii=False), encoding="utf-8"
     )
 
+
+# ---------- Работа с OKX ----------
 
 def fetch_page(symbol: str, bar: str, after_ms: int | None) -> list[list]:
     """
@@ -114,65 +122,105 @@ def fetch_page(symbol: str, bar: str, after_ms: int | None) -> list[list]:
     return payload.get("data") or []
 
 
-def fetch_data(symbol: str, bar: str, needed: int) -> pd.DataFrame:
+def candles_from_raw(raw: list[list]) -> dict[int, dict]:
+    out = {}
+    for k in raw:
+        if k[8] != "1":
+            continue
+        ts = int(k[0])
+        out[ts] = {
+            "t": ts,
+            "o": float(k[1]),
+            "h": float(k[2]),
+            "l": float(k[3]),
+            "c": float(k[4]),
+            "v": float(k[5]),
+        }
+    return out
+
+
+def update_cache(tf: str, bar: str, state: dict, needed: int) -> pd.DataFrame:
     """
-    Тянет нужное количество закрытых свечей через пагинацию.
+    Обновляет кэш свечей для таймфрейма tf.
+    - Если кэша нет: полная пагинация (нужно ~ needed свечей).
+    - Если кэш есть: тянем только свечи новее самого свежего ts в кэше.
     Возвращает DataFrame, отсортированный по возрастанию времени.
     """
-    log(f"Загрузка {symbol} {bar} с OKX (нужно ~{needed} свечей)...")
-
-    collected: dict[int, dict] = {}
-    after_ms: int | None = None
-    pages = 0
-
-    while len(collected) < needed and pages < MAX_PAGES:
-        page = fetch_page(symbol, bar, after_ms)
-        pages += 1
-
-        if not page:
-            # Дальше истории нет
-            break
-
-        new_added = 0
-        for k in page:
-            if k[8] != "1":  # только закрытые
-                continue
-            ts = int(k[0])
-            if ts in collected:
-                continue
-            collected[ts] = {
-                "open_time": pd.to_datetime(ts, unit="ms", utc=True),
-                "Open":  float(k[1]),
-                "High":  float(k[2]),
-                "Low":   float(k[3]),
-                "Close": float(k[4]),
-                "Volume": float(k[5]),
+    cache_key = f"candles_{tf}"
+    cache: dict[int, dict] = {}
+    for item in state.get(cache_key, []):
+        try:
+            cache[int(item["t"])] = {
+                "t": int(item["t"]),
+                "o": float(item["o"]),
+                "h": float(item["h"]),
+                "l": float(item["l"]),
+                "c": float(item["c"]),
+                "v": float(item["v"]),
             }
-            new_added += 1
+        except Exception:
+            continue
 
-        # Курсор — самая старая свеча на странице (минимальный ts)
-        oldest_ts = min(int(k[0]) for k in page)
-        after_ms = oldest_ts
+    if cache:
+        newest_ts = max(cache.keys())
+        log(f"[{tf}] Кэш: {len(cache)} свечей, самая свежая {pd.to_datetime(newest_ts, unit='ms', utc=True)}")
+        # Тянем только то, что новее newest_ts. У OKX history-candles
+        # параметр 'after' = "старше указанного ts". Нам нужны свечи НОВЕЕ,
+        # поэтому просто делаем один запрос без 'after' — вернёт самые свежие,
+        # а потом отфильтруем.
+        raw = fetch_page(symbol=TICKER, bar=bar, after_ms=None)
+        fresh = candles_from_raw(raw)
+        added = 0
+        for ts, c in fresh.items():
+            if ts > newest_ts:
+                cache[ts] = c
+                added += 1
+        log(f"[{tf}] Дотянуто новых свечей: {added}")
+    else:
+        log(f"[{tf}] Кэша нет — полная загрузка (нужно ~{needed} свечей)...")
+        cache = {}
+        after_ms: int | None = None
+        pages = 0
+        while len(cache) < needed and pages < MAX_PAGES:
+            page = fetch_page(TICKER, bar, after_ms)
+            pages += 1
+            if not page:
+                break
+            new_added = 0
+            for ts, c in candles_from_raw(page).items():
+                if ts not in cache:
+                    cache[ts] = c
+                    new_added += 1
+            oldest_ts = min(int(k[0]) for k in page)
+            after_ms = oldest_ts
+            if new_added == 0:
+                break
+            if len(cache) < needed:
+                time.sleep(SLEEP_BETWEEN_PAGES)
+        log(f"[{tf}] Получено {len(cache)} закрытых свечей за {pages} стр.")
 
-        if new_added == 0:
-            # Страница не дала новых данных — на всякий случай выходим
-            break
+    # Обрезаем до разумного размера, чтобы state.json не пух
+    keep_n = needed + KEEP_EXTRA
+    if len(cache) > keep_n:
+        for ts in sorted(cache.keys())[:-keep_n]:
+            cache.pop(ts, None)
+        log(f"[{tf}] Кэш обрезан до {len(cache)} свечей")
 
-        if len(collected) < needed:
-            time.sleep(SLEEP_BETWEEN_PAGES)
-
-    if not collected:
-        fail("OKX не вернул ни одной закрытой свечи")
+    # Сохраняем обратно в state
+    state[cache_key] = [cache[ts] for ts in sorted(cache.keys())]
 
     df = (
-        pd.DataFrame(list(collected.values()))
+        pd.DataFrame([cache[ts] for ts in sorted(cache.keys())])
+        .rename(columns={"t": "ts", "o": "Open", "h": "High", "l": "Low",
+                         "c": "Close", "v": "Volume"})
+        .assign(open_time=lambda d: pd.to_datetime(d["ts"], unit="ms", utc=True))
         .set_index("open_time")
         .sort_index()
     )
-
-    log(f"Получено {len(df)} закрытых свечей за {pages} стр.")
     return df
 
+
+# ---------- MA / сигнал ----------
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -222,6 +270,8 @@ def check_signal(df: pd.DataFrame, length: int) -> dict | None:
     }
 
 
+# ---------- Email ----------
+
 def send_email(subject: str, body: str, smtp_host: str, smtp_port: int) -> None:
     email_to   = os.environ.get("EMAIL_TO", "").strip()
     email_user = os.environ.get("EMAIL_USER", "").strip()
@@ -241,6 +291,8 @@ def send_email(subject: str, body: str, smtp_host: str, smtp_port: int) -> None:
         s.send_message(msg)
 
 
+# ---------- Обработка одного ТФ ----------
+
 def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> None:
     bar = TF_TO_OKX_BAR.get(tf)
     length = TF_LEN.get(tf)
@@ -249,7 +301,7 @@ def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> N
         return
 
     needed = length * WARMUP_FACTOR
-    df = fetch_data(TICKER, bar, needed)
+    df = update_cache(tf, bar, state, needed)
 
     if len(df) < length + 5:
         log(f"[{tf}] Недостаточно свечей для EMA({length}): {len(df)} — пропуск.")
@@ -300,12 +352,24 @@ def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> N
     log(f"[{tf}] EMAIL ОТПРАВЛЕН: {subject}")
 
 
+# ---------- main ----------
+
 def main() -> None:
     smtp_host = "smtp.gmail.com"
     smtp_port = 465
 
+    # TF_FILTER позволяет разделить запуски: "5m" или "4h".
+    # Если не задан — обрабатываются все ТФ из TF_LEN.
+    tf_filter = os.environ.get("TF_FILTER", "").strip()
+    if tf_filter:
+        if tf_filter not in TF_LEN:
+            fail(f"TF_FILTER='{tf_filter}' не найден в TF_LEN")
+        timeframes = [tf_filter]
+    else:
+        timeframes = list(TF_LEN.keys())
+
     state = load_state()
-    for tf in ("5m", "4h"):
+    for tf in timeframes:
         try:
             process_timeframe(tf, smtp_host, smtp_port, state)
         except SystemExit:
