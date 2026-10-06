@@ -332,17 +332,7 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         f"Сигнал EMA High/Low.\n\n"
         f"Инструмент:          {inst_id}\n"
         f"Таймфрейм:           {tf}\n"
-        f"Длина MA:            {ema_length}\n"
-        f"Тип MA:              {ma_type}\n"
-        f"Свечей в расчёте:    {sig['candles_used']}\n"
-        f"Свеча (UTC):         {candle_time}\n"
-        f"Close:               {sig['close']:.6f}\n"
-        f"High бара:           {sig['bar_high']:.6f}\n"
-        f"Low бара:            {sig['bar_low']:.6f}\n"
-        f"MA High (верхняя):   {sig['maHigh']:.6f}\n"
-        f"MA Low  (нижняя):    {sig['maLow']:.6f}\n\n"
-        f"Условие: close предыдущей свечи >= MA High, "
-        f"close текущей свечи < MA High.\n\n"
+        f"Длина MA:            {ema_length}\n\n"
         f"— EMA Alert Bot (OKX / GitHub Actions)"
     )
 
