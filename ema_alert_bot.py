@@ -13,6 +13,9 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
   MACD2: смена тёмно-красной -> светло-красной гистограммы
          (hist < 0: падение сменилось ростом)
 
+MACD считается ТОЛЬКО если EMA-условие выполнено — экономит вычисления
+на длинных сериях (EMA(2400) на 5m).
+
 Все параметры — в config.json:
   - tickers, timeframes
   - ema_type, instrument_suffix, warmup_factor
@@ -271,17 +274,18 @@ def compute_ma(series: pd.Series, length: int, ma_type: str) -> pd.Series:
     raise RuntimeError(f"Неподдерживаемый тип MA: {ma_type}")
 
 
-def compute_macd(df: pd.DataFrame, fast: int, slow: int, sig_len: int) -> pd.DataFrame:
-    close = df["Close"]
+def compute_macd(close: pd.Series, fast: int, slow: int, sig_len: int) -> pd.DataFrame:
+    """Считает MACD. Принимает только close-серию, возвращает DataFrame с 3 колонками."""
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=sig_len, adjust=False).mean()
-    out = df.copy()
-    out["macd"] = macd_line
-    out["macd_signal"] = signal_line
-    out["hist"] = macd_line - signal_line
-    return out
+    hist = macd_line - signal_line
+    return pd.DataFrame({
+        "macd": macd_line,
+        "macd_signal": signal_line,
+        "hist": hist,
+    })
 
 
 def hist_color(hist: float, hist_prev: float) -> str:
@@ -296,45 +300,26 @@ def hist_color(hist: float, hist_prev: float) -> str:
     return "dark_red"
 
 
-def check_signal(df: pd.DataFrame, length: int, ma_type: str,
-                 fast: int, slow: int, sig_len: int) -> dict | None:
+def check_ema_condition(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
     """
-    Проверяет три условия на последней закрытой свече:
-      1) close[prev] >= maHigh[prev] и close[curr] < maHigh[curr]
-      2) macd_signal[curr] < 0
-      3) hist-цвет сменился dark_red -> light_red
+    Проверяет ТОЛЬКО EMA-условие: close[prev] >= maHigh[prev] и close[curr] < maHigh[curr].
+    Если условия нет — возвращает None (MACD даже не считаем).
     """
-    min_bars = max(length, slow + sig_len) + 5
-    if len(df) < min_bars:
+    if len(df) < length + 5:
         return None
 
     df = df.copy()
     df["maHigh"] = compute_ma(df["High"], length, ma_type)
     df["maLow"]  = compute_ma(df["Low"],  length, ma_type)
-    df = compute_macd(df, fast, slow, sig_len)
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
-    before = df.iloc[-3]
 
     if pd.isna(curr["maHigh"]) or pd.isna(prev["maHigh"]):
         return None
-    if pd.isna(curr["macd_signal"]) or pd.isna(curr["hist"]) or pd.isna(prev["hist"]):
-        return None
 
-    # 1) пересечение close ниже maHigh
     crossed_below = (prev["Close"] >= prev["maHigh"]) and (curr["Close"] < curr["maHigh"])
     if not crossed_below:
-        return None
-
-    # 2) signal < 0
-    if not (float(curr["macd_signal"]) < 0):
-        return None
-
-    # 3) смена dark_red -> light_red
-    c_curr = hist_color(float(curr["hist"]), float(prev["hist"]))
-    c_prev = hist_color(float(prev["hist"]), float(before["hist"]))
-    if not (c_prev == "dark_red" and c_curr == "light_red"):
         return None
 
     return {
@@ -346,9 +331,44 @@ def check_signal(df: pd.DataFrame, length: int, ma_type: str,
         "bar_high": float(curr["High"]),
         "bar_low": float(curr["Low"]),
         "candles_used": len(df),
-        "macd_signal": float(curr["macd_signal"]),
-        "hist": float(curr["hist"]),
-        "hist_prev": float(prev["hist"]),
+    }
+
+
+def check_macd_condition(df: pd.DataFrame,
+                         fast: int, slow: int, sig_len: int) -> dict | None:
+    """
+    Проверяет ТОЛЬКО MACD-условие:
+      signal < 0  И  смена dark_red -> light_red.
+    Вызывается уже ПОСЛЕ выполнения EMA-условия.
+    """
+    min_bars = slow + sig_len + 5
+    if len(df) < min_bars:
+        return None
+
+    macd_df = compute_macd(df["Close"], fast, slow, sig_len)
+
+    curr_hist = float(macd_df["hist"].iloc[-1])
+    prev_hist = float(macd_df["hist"].iloc[-2])
+    before_hist = float(macd_df["hist"].iloc[-3])
+    curr_signal = float(macd_df["macd_signal"].iloc[-1])
+
+    if pd.isna(curr_hist) or pd.isna(prev_hist) or pd.isna(before_hist) or pd.isna(curr_signal):
+        return None
+
+    # 1) signal < 0
+    if not (curr_signal < 0):
+        return None
+
+    # 2) dark_red -> light_red
+    c_curr = hist_color(curr_hist, prev_hist)
+    c_prev = hist_color(prev_hist, before_hist)
+    if not (c_prev == "dark_red" and c_curr == "light_red"):
+        return None
+
+    return {
+        "macd_signal": curr_signal,
+        "hist": curr_hist,
+        "hist_prev": prev_hist,
     }
 
 
@@ -403,16 +423,21 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         log(f"  [{ticker} {tf}] Ошибка загрузки: {e}")
         return
 
-    if len(df) < max(ema_length, macd_slow + macd_sig) + 5:
-        dbg(f"  [{ticker} {tf}] мало свечей: {len(df)}")
+    # Шаг 1: EMA-условие. Если не выполнено — выходим, MACD НЕ считаем.
+    ema_sig = check_ema_condition(df, ema_length, ma_type)
+    if not ema_sig:
+        dbg(f"  [{ticker} {tf}] EMA-условия нет (MACD не считался).")
         return
 
-    sig = check_signal(df, ema_length, ma_type, macd_fast, macd_slow, macd_sig)
-    if not sig:
-        dbg(f"  [{ticker} {tf}] условий нет.")
+    dbg(f"  [{ticker} {tf}] EMA-условие выполнено, проверяю MACD...")
+
+    # Шаг 2: MACD-условие
+    macd_sig_data = check_macd_condition(df, macd_fast, macd_slow, macd_sig)
+    if not macd_sig_data:
+        dbg(f"  [{ticker} {tf}] EMA есть, MACD-условия нет.")
         return
 
-    candle_time = sig["candle_time"]
+    candle_time = ema_sig["candle_time"]
     dedup_key = f"last_signal_candle_{inst_id}_{tf}"
     if state.get(dedup_key) == candle_time:
         dbg(f"  [{ticker} {tf}] сигнал по свече {candle_time} уже отправлялся.")
@@ -424,15 +449,16 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         "tf": tf,
         "ema_length": ema_length,
         "candle_time": candle_time,
-        "close": sig["close"],
-        "maHigh": sig["maHigh"],
-        "macd_signal": sig["macd_signal"],
-        "hist": sig["hist"],
-        "hist_prev": sig["hist_prev"],
+        "close": ema_sig["close"],
+        "maHigh": ema_sig["maHigh"],
+        "macd_signal": macd_sig_data["macd_signal"],
+        "hist": macd_sig_data["hist"],
+        "hist_prev": macd_sig_data["hist_prev"],
     })
     log(f"  [{ticker} {tf}] СИГНАЛ "
-        f"(close {sig['close']:.6f} < maHigh {sig['maHigh']:.6f}, "
-        f"signal {sig['macd_signal']:.4f} < 0, hist {sig['hist_prev']:.6f} -> {sig['hist']:.6f})")
+        f"(close {ema_sig['close']:.6f} < maHigh {ema_sig['maHigh']:.6f}, "
+        f"signal {macd_sig_data['macd_signal']:.4f} < 0, "
+        f"hist {macd_sig_data['hist_prev']:.6f} -> {macd_sig_data['hist']:.6f})")
 
 
 # ---------- main ----------
