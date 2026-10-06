@@ -3,23 +3,17 @@
     "BTC-USD",
     "ETH-USD",
     "TRUMP-USD",
-    "POL-USD",
-    "APT-USD",
-    "LINEA-USD",
     "LTC-USD",
     "ICP-USD",
-    "FIL-USD",
     "DASH-USD",
     "ETC-USD",
-    "ALGO-USD",
     "DOGE-USD",
     "ARB-USD",
-    "AVAX-USD",
     "XRP-USD",
     "TRX-USD",
     "DOT-USD",
     "STRK-USD",
-    "ADA-USD"
+    "MNT-USD"
   ],
   "timeframes": {
     "5m": { "ema_length": 2400 },
@@ -27,5 +21,10 @@
   },
   "ema_type": "EMA",
   "instrument_suffix": "-USDT-SWAP",
-  "warmup_factor": 3
+  "warmup_factor": 3,
+  "macd": {
+    "fast": 12,
+    "slow": 26,
+    "signal": 9
+  }
 }
