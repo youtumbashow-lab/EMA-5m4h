@@ -16,6 +16,9 @@ EMA High/Low Alert Bot — multi-ticker, 5m / 4h — OKX
   - instrument_suffix: -USDT-SWAP (своп) или -USDT (спот)
   - warmup_factor   : множитель запаса свечей для разогрева EMA
 
+Все сработавшие сигналы за прогон собираются в один список
+и отправляются ОДНИМ письмом. Если сигналов нет — письмо не шлётся.
+
 Свечи кэшируются в state.json: при повторном запуске тянем только новые.
 Дедуп сигналов — на пару (ticker, timeframe).
 
@@ -290,7 +293,8 @@ def send_email(subject: str, body: str, smtp_host: str, smtp_port: int) -> None:
 # ---------- Обработка одного тикера ----------
 
 def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
-                   state: dict, smtp_host: str, smtp_port: int) -> None:
+                   state: dict, signals: list) -> None:
+    """Проверяет один тикер на одном ТФ. При сигнале добавляет запись в signals."""
     suffix = cfg.get("instrument_suffix", "-USDT-SWAP")
     ma_type = cfg.get("ema_type", "EMA")
     warmup_factor = int(cfg.get("warmup_factor", 3))
@@ -327,23 +331,16 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         log(f"  [{ticker} {tf}] сигнал по свече {candle_time} уже отправлялся.")
         return
 
-    subject = f"[EMA] {inst_id} ({tf}) — цена закрылась ниже верхней границы"
-    body = (
-        f"Сигнал EMA High/Low.\n\n"
-        f"Инструмент:          {inst_id}\n"
-        f"Таймфрейм:           {tf}\n"
-        f"Длина MA:            {ema_length}\n\n"
-        f"— EMA Alert Bot (OKX / GitHub Actions)"
-    )
-
-    try:
-        send_email(subject, body, smtp_host, smtp_port)
-    except Exception as e:
-        log(f"  [{ticker} {tf}] Не удалось отправить email: {e}")
-        return
-
     state[dedup_key] = candle_time
-    log(f"  [{ticker} {tf}] EMAIL ОТПРАВЛЕН")
+    signals.append({
+        "inst_id": inst_id,
+        "tf": tf,
+        "ema_length": ema_length,
+        "candle_time": candle_time,
+        "close": sig["close"],
+        "maHigh": sig["maHigh"],
+    })
+    log(f"  [{ticker} {tf}] СИГНАЛ (close {sig['close']:.6f} < maHigh {sig['maHigh']:.6f})")
 
 
 # ---------- main ----------
@@ -357,6 +354,7 @@ def main() -> None:
     timeframes = cfg["timeframes"]
 
     state = load_state()
+    signals: list = []
 
     log(f"Тикеров: {len(tickers)}, ТФ: {list(timeframes.keys())}")
 
@@ -365,14 +363,43 @@ def main() -> None:
         log(f"=== ТФ {tf} (EMA {ema_length}) ===")
         for ticker in tickers:
             try:
-                process_ticker(ticker, tf, ema_length, cfg,
-                               state, smtp_host, smtp_port)
+                process_ticker(ticker, tf, ema_length, cfg, state, signals)
             except SystemExit:
                 raise
             except Exception as e:
                 log(f"  [{ticker} {tf}] Ошибка: {e}")
 
     save_state(state)
+
+    if not signals:
+        log("Сигналов нет — письмо не отправляется.")
+        log("Готово.")
+        return
+
+    log(f"СИГНАЛОВ: {len(signals)} — отправляю одно письмо.")
+
+    # ---- Одно письмо со списком сигналов ----
+    subject = f"[EMA] Сигналы: {len(signals)}"
+    if len(signals) == 1:
+        subject = f"[EMA] {signals[0]['inst_id']} ({signals[0]['tf']})"
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [f"Сигналы EMA High/Low — {now_utc}", ""]
+    for i, s in enumerate(signals, 1):
+        lines.append(
+            f"{i}. {s['inst_id']} ({s['tf']}) — "
+            f"close {s['close']:.6f} < MA High {s['maHigh']:.6f}"
+        )
+    lines.append("")
+    lines.append("— EMA Alert Bot (OKX / GitHub Actions)")
+    body = "\n".join(lines)
+
+    try:
+        send_email(subject, body, smtp_host, smtp_port)
+    except Exception as e:
+        fail(f"Не удалось отправить email: {e}")
+
+    log(f"EMAIL ОТПРАВЛЕН: {subject}")
     log("Готово.")
 
 
