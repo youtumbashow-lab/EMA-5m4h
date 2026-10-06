@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EMA High/Low Alert Bot — multi-ticker, 5m / 4h — OKX
-=====================================================
-Аналог индикатора "High/Low EMA Area" (Pine v6).
+EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
+============================================================
+Аналог индикатора "High/Low EMA Area" (Pine v6) + MACD-фильтр.
 
-Логика сигнала на последней ЗАКРЫТОЙ свече:
-    maHigh = EMA(high, len)
-    Сигнал: close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
+Сигнал на последней ЗАКРЫТОЙ свече при ОДНОВРЕМЕННОМ выполнении:
+
+  EMA:   close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
+         (maHigh = MA(high, ema_length))
+  MACD1: signal(9) < 0
+  MACD2: смена тёмно-красной -> светло-красной гистограммы
+         (hist < 0: падение сменилось ростом)
 
 Все параметры — в config.json:
-  - tickers         : список инструментов
-  - timeframes      : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
-  - ema_type        : EMA | SMA
-  - instrument_suffix: -USDT-SWAP (своп) или -USDT (спот)
-  - warmup_factor   : множитель запаса свечей для разогрева EMA
+  - tickers, timeframes
+  - ema_type, instrument_suffix, warmup_factor
+  - macd.fast / macd.slow / macd.signal
 
 Все сработавшие сигналы за прогон собираются в один список
 и отправляются ОДНИМ письмом. Если сигналов нет — письмо не шлётся.
 
-Свечи кэшируются в state.json: при повторном запуске тянем только новые.
-Дедуп сигналов — на пару (ticker, timeframe).
+Кэш свечей хранится в state.json в пределах последних KEEP_CANDLES свечей.
+
+Логи:
+  - по умолчанию печатаются только итоги и сигналы;
+  - при DEBUG=1 — подробный лог по каждому тикеру и страницам OKX.
 
 Секреты (Settings -> Secrets and variables -> Actions):
   EMAIL_TO, EMAIL_USER, EMAIL_APP_PASSWORD
@@ -47,7 +52,11 @@ STATE_PATH = BASE_DIR / "state.json"
 PAGE_LIMIT = 100
 MAX_PAGES = 300
 SLEEP_BETWEEN_PAGES = 0.12
-KEEP_EXTRA = 200
+
+KEEP_CANDLES = 5000
+RETRY_DELAY_SEC = 20
+
+DEBUG = os.environ.get("DEBUG", "").strip() == "1"
 
 TF_TO_OKX_BAR = {
     "1m":  "1m",
@@ -70,6 +79,11 @@ def log(msg: str) -> None:
     print(f"[{stamp}] {msg}", flush=True)
 
 
+def dbg(msg: str) -> None:
+    if DEBUG:
+        log(msg)
+
+
 def fail(msg: str) -> None:
     log(f"ОШИБКА: {msg}")
     sys.exit(1)
@@ -84,6 +98,7 @@ def load_config() -> dict:
         fail("В config.json пустой список tickers")
     if not cfg.get("timeframes"):
         fail("В config.json пустой объект timeframes")
+    cfg.setdefault("macd", {"fast": 12, "slow": 26, "signal": 9})
     return cfg
 
 
@@ -152,6 +167,25 @@ def candles_from_raw(raw: list[list]) -> dict[int, dict]:
     return out
 
 
+def _trim_cache(cache: dict[int, dict]) -> None:
+    if len(cache) > KEEP_CANDLES:
+        for ts in sorted(cache.keys())[:-KEEP_CANDLES]:
+            cache.pop(ts, None)
+
+
+def _update_from_okx(cache: dict[int, dict], inst_id: str, bar: str,
+                     newest_ts: int | None) -> int:
+    raw = fetch_page(inst_id, bar, after_ms=None)
+    fresh = candles_from_raw(raw)
+    added = 0
+    for ts, c in fresh.items():
+        if newest_ts is None or ts > newest_ts:
+            if ts not in cache:
+                cache[ts] = c
+                added += 1
+    return added
+
+
 def update_cache(inst_id: str, bar: str, cache_key: str,
                  state: dict, needed: int) -> pd.DataFrame:
     cache: dict[int, dict] = {}
@@ -170,17 +204,18 @@ def update_cache(inst_id: str, bar: str, cache_key: str,
 
     if cache:
         newest_ts = max(cache.keys())
-        log(f"    кэш: {len(cache)} свечей, самая свежая "
+        dbg(f"    кэш: {len(cache)} свечей, самая свежая "
             f"{pd.to_datetime(newest_ts, unit='ms', utc=True)}")
-        raw = fetch_page(inst_id, bar, after_ms=None)
-        fresh = candles_from_raw(raw)
-        added = sum(1 for ts in fresh if ts > newest_ts)
-        for ts, c in fresh.items():
-            if ts > newest_ts:
-                cache[ts] = c
-        log(f"    дотянуто новых: {added}")
+        added = _update_from_okx(cache, inst_id, bar, newest_ts)
+        dbg(f"    дотянуто новых: {added}")
+
+        if added == 0:
+            dbg(f"    новых свечей нет — retry через {RETRY_DELAY_SEC} сек...")
+            time.sleep(RETRY_DELAY_SEC)
+            added2 = _update_from_okx(cache, inst_id, bar, newest_ts)
+            dbg(f"    после retry дотянуто: {added2}")
     else:
-        log(f"    кэша нет — полная загрузка (~{needed} свечей)...")
+        dbg(f"    кэша нет — полная загрузка (~{needed} свечей)...")
         cache = {}
         after_ms: int | None = None
         pages = 0
@@ -200,12 +235,9 @@ def update_cache(inst_id: str, bar: str, cache_key: str,
                 break
             if len(cache) < needed:
                 time.sleep(SLEEP_BETWEEN_PAGES)
-        log(f"    получено {len(cache)} закрытых свечей за {pages} стр.")
+        dbg(f"    получено {len(cache)} закрытых свечей за {pages} стр.")
 
-    keep_n = needed + KEEP_EXTRA
-    if len(cache) > keep_n:
-        for ts in sorted(cache.keys())[:-keep_n]:
-            cache.pop(ts, None)
+    _trim_cache(cache)
 
     state[cache_key] = [cache[ts] for ts in sorted(cache.keys())]
 
@@ -220,7 +252,7 @@ def update_cache(inst_id: str, bar: str, cache_key: str,
     return df
 
 
-# ---------- MA / сигнал ----------
+# ---------- MA / MACD / сигнал ----------
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -239,22 +271,70 @@ def compute_ma(series: pd.Series, length: int, ma_type: str) -> pd.Series:
     raise RuntimeError(f"Неподдерживаемый тип MA: {ma_type}")
 
 
-def check_signal(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
-    if len(df) < 3:
+def compute_macd(df: pd.DataFrame, fast: int, slow: int, sig_len: int) -> pd.DataFrame:
+    close = df["Close"]
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=sig_len, adjust=False).mean()
+    out = df.copy()
+    out["macd"] = macd_line
+    out["macd_signal"] = signal_line
+    out["hist"] = macd_line - signal_line
+    return out
+
+
+def hist_color(hist: float, hist_prev: float) -> str:
+    if hist == 0:
+        return "neutral"
+    if hist > 0 and hist < hist_prev:
+        return "light_green"
+    if hist > 0:
+        return "dark_green"
+    if hist < 0 and hist > hist_prev:
+        return "light_red"
+    return "dark_red"
+
+
+def check_signal(df: pd.DataFrame, length: int, ma_type: str,
+                 fast: int, slow: int, sig_len: int) -> dict | None:
+    """
+    Проверяет три условия на последней закрытой свече:
+      1) close[prev] >= maHigh[prev] и close[curr] < maHigh[curr]
+      2) macd_signal[curr] < 0
+      3) hist-цвет сменился dark_red -> light_red
+    """
+    min_bars = max(length, slow + sig_len) + 5
+    if len(df) < min_bars:
         return None
 
     df = df.copy()
     df["maHigh"] = compute_ma(df["High"], length, ma_type)
     df["maLow"]  = compute_ma(df["Low"],  length, ma_type)
+    df = compute_macd(df, fast, slow, sig_len)
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
+    before = df.iloc[-3]
 
     if pd.isna(curr["maHigh"]) or pd.isna(prev["maHigh"]):
         return None
+    if pd.isna(curr["macd_signal"]) or pd.isna(curr["hist"]) or pd.isna(prev["hist"]):
+        return None
 
+    # 1) пересечение close ниже maHigh
     crossed_below = (prev["Close"] >= prev["maHigh"]) and (curr["Close"] < curr["maHigh"])
     if not crossed_below:
+        return None
+
+    # 2) signal < 0
+    if not (float(curr["macd_signal"]) < 0):
+        return None
+
+    # 3) смена dark_red -> light_red
+    c_curr = hist_color(float(curr["hist"]), float(prev["hist"]))
+    c_prev = hist_color(float(prev["hist"]), float(before["hist"]))
+    if not (c_prev == "dark_red" and c_curr == "light_red"):
         return None
 
     return {
@@ -266,6 +346,9 @@ def check_signal(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
         "bar_high": float(curr["High"]),
         "bar_low": float(curr["Low"]),
         "candles_used": len(df),
+        "macd_signal": float(curr["macd_signal"]),
+        "hist": float(curr["hist"]),
+        "hist_prev": float(prev["hist"]),
     }
 
 
@@ -294,21 +377,25 @@ def send_email(subject: str, body: str, smtp_host: str, smtp_port: int) -> None:
 
 def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
                    state: dict, signals: list) -> None:
-    """Проверяет один тикер на одном ТФ. При сигнале добавляет запись в signals."""
     suffix = cfg.get("instrument_suffix", "-USDT-SWAP")
     ma_type = cfg.get("ema_type", "EMA")
     warmup_factor = int(cfg.get("warmup_factor", 3))
+    macd_cfg = cfg.get("macd", {})
+    macd_fast = int(macd_cfg.get("fast", 12))
+    macd_slow = int(macd_cfg.get("slow", 26))
+    macd_sig  = int(macd_cfg.get("signal", 9))
 
     bar = TF_TO_OKX_BAR.get(tf)
     if not bar:
-        log(f"  [{ticker} {tf}] Неизвестный ТФ — пропуск.")
+        dbg(f"  [{ticker} {tf}] Неизвестный ТФ — пропуск.")
         return
 
     inst_id = to_okx_inst(ticker, suffix)
-    needed = ema_length * warmup_factor
+    needed = max(ema_length, macd_slow + macd_sig) * warmup_factor
     cache_key = f"candles_{inst_id}_{tf}"
 
-    log(f"  [{ticker} {tf}] inst={inst_id}, EMA={ema_length}, нужно ~{needed}")
+    dbg(f"  [{ticker} {tf}] inst={inst_id}, EMA={ema_length}, "
+        f"MACD={macd_fast}/{macd_slow}/{macd_sig}, нужно ~{needed}")
 
     try:
         df = update_cache(inst_id, bar, cache_key, state, needed)
@@ -316,19 +403,19 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         log(f"  [{ticker} {tf}] Ошибка загрузки: {e}")
         return
 
-    if len(df) < ema_length + 5:
-        log(f"  [{ticker} {tf}] мало свечей для EMA({ema_length}): {len(df)}")
+    if len(df) < max(ema_length, macd_slow + macd_sig) + 5:
+        dbg(f"  [{ticker} {tf}] мало свечей: {len(df)}")
         return
 
-    sig = check_signal(df, ema_length, ma_type)
+    sig = check_signal(df, ema_length, ma_type, macd_fast, macd_slow, macd_sig)
     if not sig:
-        log(f"  [{ticker} {tf}] пересечения нет.")
+        dbg(f"  [{ticker} {tf}] условий нет.")
         return
 
     candle_time = sig["candle_time"]
     dedup_key = f"last_signal_candle_{inst_id}_{tf}"
     if state.get(dedup_key) == candle_time:
-        log(f"  [{ticker} {tf}] сигнал по свече {candle_time} уже отправлялся.")
+        dbg(f"  [{ticker} {tf}] сигнал по свече {candle_time} уже отправлялся.")
         return
 
     state[dedup_key] = candle_time
@@ -339,8 +426,13 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         "candle_time": candle_time,
         "close": sig["close"],
         "maHigh": sig["maHigh"],
+        "macd_signal": sig["macd_signal"],
+        "hist": sig["hist"],
+        "hist_prev": sig["hist_prev"],
     })
-    log(f"  [{ticker} {tf}] СИГНАЛ (close {sig['close']:.6f} < maHigh {sig['maHigh']:.6f})")
+    log(f"  [{ticker} {tf}] СИГНАЛ "
+        f"(close {sig['close']:.6f} < maHigh {sig['maHigh']:.6f}, "
+        f"signal {sig['macd_signal']:.4f} < 0, hist {sig['hist_prev']:.6f} -> {sig['hist']:.6f})")
 
 
 # ---------- main ----------
@@ -356,11 +448,12 @@ def main() -> None:
     state = load_state()
     signals: list = []
 
-    log(f"Тикеров: {len(tickers)}, ТФ: {list(timeframes.keys())}")
+    log(f"Тикеров: {len(tickers)}, ТФ: {list(timeframes.keys())}"
+        + ("" if DEBUG else " (DEBUG=1 для подробного лога)"))
 
     for tf, tf_cfg in timeframes.items():
         ema_length = int(tf_cfg["ema_length"])
-        log(f"=== ТФ {tf} (EMA {ema_length}) ===")
+        dbg(f"=== ТФ {tf} (EMA {ema_length}) ===")
         for ticker in tickers:
             try:
                 process_ticker(ticker, tf, ema_length, cfg, state, signals)
@@ -378,20 +471,22 @@ def main() -> None:
 
     log(f"СИГНАЛОВ: {len(signals)} — отправляю одно письмо.")
 
-    # ---- Одно письмо со списком сигналов ----
-    subject = f"[EMA] Сигналы: {len(signals)}"
+    subject = f"[EMA+MACD] Сигналы: {len(signals)}"
     if len(signals) == 1:
-        subject = f"[EMA] {signals[0]['inst_id']} ({signals[0]['tf']})"
+        s = signals[0]
+        subject = f"[EMA+MACD] {s['inst_id']} ({s['tf']})"
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    lines = [f"Сигналы EMA High/Low — {now_utc}", ""]
+    lines = [f"Сигналы EMA High/Low + MACD — {now_utc}", ""]
     for i, s in enumerate(signals, 1):
         lines.append(
             f"{i}. {s['inst_id']} ({s['tf']}) — "
-            f"close {s['close']:.6f} < MA High {s['maHigh']:.6f}"
+            f"close {s['close']:.6f} < MA High {s['maHigh']:.6f}, "
+            f"signal(9) {s['macd_signal']:.4f} < 0, "
+            f"hist {s['hist_prev']:.6f} -> {s['hist']:.6f}"
         )
     lines.append("")
-    lines.append("— EMA Alert Bot (OKX / GitHub Actions)")
+    lines.append("— EMA+MACD Alert Bot (OKX / GitHub Actions)")
     body = "\n".join(lines)
 
     try:
