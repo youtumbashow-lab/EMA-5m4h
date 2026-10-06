@@ -1,10 +1,8 @@
 name: EMA High/Low Alert (BTC-USDT-SWAP 5m / 4h)
 
 on:
-  schedule:
-    # Каждую минуту — чтобы не пропустить момент закрытия 5m-свечи.
-    # Логика отправки внутри скрипта: письмо уходит один раз на закрытую свечу.
-    - cron: "* * * * *"
+  # Только внешний триггер. Расписание задаётся на cron-job.org,
+  # который дёргает workflow_dispatch через GitHub API.
   workflow_dispatch: {}
 
 permissions:
