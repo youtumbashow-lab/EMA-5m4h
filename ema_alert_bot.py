@@ -3,15 +3,15 @@
 """
 EMA High/Low Alert Bot — BTC-USDT-SWAP (5m / 4h) — OKX
 =======================================================
-Аналог индикатора "High/Low EMA Area" (Pine v6), но в виде Python-бота.
+Аналог индикатора "High/Low EMA Area" (Pine v6).
 
-Логика сигнала:
-    maLow  = EMA(low,  len)
+Логика сигнала на последней ЗАКРЫТОЙ свече:
     maHigh = EMA(high, len)
+    Сигнал: close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
     len = 2400 для 5m, 200 для 4h.
 
-Сигнал: на последней ЗАКРЫТОЙ свече close пересёк maHigh сверху вниз:
-    close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
+Данные тянутся через /api/v5/market/history-candles с пагинацией,
+чтобы EMA(2400) на 5m считалась честно, а не по 300 свечам.
 
 Запускается внешним триггером (cron-job.org -> workflow_dispatch).
 Дедуп по свече — через state.json (кэшируется между запусками Actions).
@@ -25,6 +25,7 @@ import os
 import smtplib
 import ssl
 import sys
+import time
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
@@ -40,8 +41,8 @@ TICKER = "BTC-USDT-SWAP"
 EMA_TYPE = "EMA"
 
 TF_LEN = {
-    "5m":  2400,
-    "4h":  200,
+    "5m": 2400,
+    "4h": 200,
 }
 
 TF_TO_OKX_BAR = {
@@ -49,7 +50,18 @@ TF_TO_OKX_BAR = {
     "4h": "4H",
 }
 
-CANDLES_LIMIT = 300
+# Множитель запаса: сколько свечей тянем относительно длины EMA.
+# Нужен, чтобы EMA "разогрелась" и последние значения совпадали с TradingView.
+WARMUP_FACTOR = 3
+
+# OKX history-candles: лимит одной страницы
+PAGE_LIMIT = 100
+
+# Максимум страниц на всякий случай (защита от бесконечного цикла)
+MAX_PAGES = 100
+
+# Пауза между запросами (OKX rate limit: 20 req / 2 sec на history-candles)
+SLEEP_BETWEEN_PAGES = 0.12
 
 
 def log(msg: str) -> None:
@@ -78,10 +90,17 @@ def save_state(state: dict) -> None:
     )
 
 
-def fetch_data(symbol: str, bar: str) -> pd.DataFrame:
-    log(f"Загрузка {symbol} {bar} с OKX...")
-    url = "https://www.okx.com/api/v5/market/candles"
-    params = {"instId": symbol, "bar": bar, "limit": str(CANDLES_LIMIT)}
+def fetch_page(symbol: str, bar: str, after_ms: int | None) -> list[list]:
+    """
+    Одна страница history-candles.
+    after_ms = timestamp в мс: вернёт свечи СТАРШЕ этого времени.
+    Если after_ms is None — вернёт самые свежие.
+    """
+    url = "https://www.okx.com/api/v5/market/history-candles"
+    params = {"instId": symbol, "bar": bar, "limit": str(PAGE_LIMIT)}
+    if after_ms is not None:
+        params["after"] = str(after_ms)
+
     try:
         resp = requests.get(url, params=params, timeout=20)
         resp.raise_for_status()
@@ -92,27 +111,67 @@ def fetch_data(symbol: str, bar: str) -> pd.DataFrame:
     if payload.get("code") != "0":
         fail(f"OKX вернул ошибку: {payload.get('msg', 'неизвестно')}")
 
-    raw = payload.get("data") or []
-    if not raw:
-        fail(f"OKX вернул пустой ответ для {symbol} {bar}")
+    return payload.get("data") or []
 
-    rows = []
-    for k in raw:
-        if k[8] != "1":
-            continue
-        rows.append({
-            "open_time": pd.to_datetime(int(k[0]), unit="ms", utc=True),
-            "Open":  float(k[1]),
-            "High":  float(k[2]),
-            "Low":   float(k[3]),
-            "Close": float(k[4]),
-            "Volume": float(k[5]),
-        })
 
-    if not rows:
+def fetch_data(symbol: str, bar: str, needed: int) -> pd.DataFrame:
+    """
+    Тянет нужное количество закрытых свечей через пагинацию.
+    Возвращает DataFrame, отсортированный по возрастанию времени.
+    """
+    log(f"Загрузка {symbol} {bar} с OKX (нужно ~{needed} свечей)...")
+
+    collected: dict[int, dict] = {}
+    after_ms: int | None = None
+    pages = 0
+
+    while len(collected) < needed and pages < MAX_PAGES:
+        page = fetch_page(symbol, bar, after_ms)
+        pages += 1
+
+        if not page:
+            # Дальше истории нет
+            break
+
+        new_added = 0
+        for k in page:
+            if k[8] != "1":  # только закрытые
+                continue
+            ts = int(k[0])
+            if ts in collected:
+                continue
+            collected[ts] = {
+                "open_time": pd.to_datetime(ts, unit="ms", utc=True),
+                "Open":  float(k[1]),
+                "High":  float(k[2]),
+                "Low":   float(k[3]),
+                "Close": float(k[4]),
+                "Volume": float(k[5]),
+            }
+            new_added += 1
+
+        # Курсор — самая старая свеча на странице (минимальный ts)
+        oldest_ts = min(int(k[0]) for k in page)
+        after_ms = oldest_ts
+
+        if new_added == 0:
+            # Страница не дала новых данных — на всякий случай выходим
+            break
+
+        if len(collected) < needed:
+            time.sleep(SLEEP_BETWEEN_PAGES)
+
+    if not collected:
         fail("OKX не вернул ни одной закрытой свечи")
 
-    return pd.DataFrame(rows).set_index("open_time").sort_index()
+    df = (
+        pd.DataFrame(list(collected.values()))
+        .set_index("open_time")
+        .sort_index()
+    )
+
+    log(f"Получено {len(df)} закрытых свечей за {pages} стр.")
+    return df
 
 
 def ema(series: pd.Series, length: int) -> pd.Series:
@@ -159,6 +218,7 @@ def check_signal(df: pd.DataFrame, length: int) -> dict | None:
         "length": length,
         "bar_high": float(curr["High"]),
         "bar_low": float(curr["Low"]),
+        "candles_used": len(df),
     }
 
 
@@ -188,7 +248,13 @@ def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> N
         log(f"Таймфрейм {tf} не поддерживается — пропуск.")
         return
 
-    df = fetch_data(TICKER, bar)
+    needed = length * WARMUP_FACTOR
+    df = fetch_data(TICKER, bar, needed)
+
+    if len(df) < length + 5:
+        log(f"[{tf}] Недостаточно свечей для EMA({length}): {len(df)} — пропуск.")
+        return
+
     sig = check_signal(df, length)
     if not sig:
         log(f"[{tf}] Пересечения close ниже maHigh({length}) нет.")
@@ -206,6 +272,7 @@ def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> N
         f"Инструмент:          {TICKER}\n"
         f"Таймфрейм:           {tf}\n"
         f"Длина MA:            {length}\n"
+        f"Свечей в расчёте:    {sig['candles_used']}\n"
         f"Свеча (UTC):         {candle_time}\n"
         f"Close:               {sig['close']:.2f}\n"
         f"High бара:           {sig['bar_high']:.2f}\n"
@@ -228,6 +295,7 @@ def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> N
         "close": sig["close"],
         "maHigh": sig["maHigh"],
         "maLow": sig["maLow"],
+        "candles_used": sig["candles_used"],
     }
     log(f"[{tf}] EMAIL ОТПРАВЛЕН: {subject}")
 
