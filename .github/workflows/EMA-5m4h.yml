@@ -1,15 +1,16 @@
-name: EMA High/Low Alert (BTC-USDT-SWAP 5m / 4h)
+name: EMA High/Low Alert — 5m (BTC-USDT-SWAP)
 
 on:
-  # Только внешний триггер. Расписание задаётся на cron-job.org,
-  # который дёргает workflow_dispatch через GitHub API.
+  # Расписание — на cron-job.org:
+  # POST https://api.github.com/repos/<USER>/<REPO>/actions/workflows/EMA-5m.yml/dispatches
+  # Body: {"ref":"main"}
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ema-alert-5m4h
+  group: ema-alert-5m
   cancel-in-progress: false
 
 jobs:
@@ -34,15 +35,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: state.json
-          key: ema-state-${{ github.run_id }}
+          key: ema-state-5m-${{ github.run_id }}
           restore-keys: |
-            ema-state-
+            ema-state-5m-
 
       - name: Run bot
         env:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          TF_FILTER: "5m"
         run: python ema_alert_bot.py
 
       - name: Save state
@@ -50,4 +52,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: state.json
-          key: ema-state-${{ github.run_id }}
+          key: ema-state-5m-${{ github.run_id }}
