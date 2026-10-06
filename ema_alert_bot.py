@@ -17,9 +17,13 @@ MACD считается ТОЛЬКО если EMA-условие выполне�
 на длинных сериях (EMA(2400) на 5m).
 
 Все параметры — в config.json:
-  - tickers, timeframes
-  - ema_type, instrument_suffix, warmup_factor
+  - tickers         : список ПОЛНЫХ OKX-инструментов (например BTC-USDT-SWAP, MNT-USDT)
+  - timeframes      : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
+  - ema_type        : EMA | SMA
+  - warmup_factor   : множитель запаса свечей для разогрева EMA
   - macd.fast / macd.slow / macd.signal
+
+Никаких авто-приклеек суффиксов — что в config.json, то и идёт в OKX.
 
 Все сработавшие сигналы за прогон собираются в один список
 и отправляются ОДНИМ письмом. Если сигналов нет — письмо не шлётся.
@@ -122,18 +126,6 @@ def save_state(state: dict) -> None:
 
 
 # ---------- OKX ----------
-
-def to_okx_inst(ticker: str, suffix: str) -> str:
-    """
-    'BTC-USD'   + '-USDT-SWAP'  -> 'BTC-USDT-SWAP'
-    'BTC-USDT'  + ''            -> 'BTC-USDT'
-    Если тикер уже в формате OKX ('BTC-USDT-SWAP') — возвращаем как есть.
-    """
-    if ticker.endswith(("-SWAP", "-USDT", "-USDC")):
-        return ticker
-    base = ticker.split("-")[0]
-    return f"{base}{suffix}"
-
 
 def fetch_page(inst_id: str, bar: str, after_ms: int | None) -> list[list]:
     url = "https://www.okx.com/api/v5/market/history-candles"
@@ -275,7 +267,6 @@ def compute_ma(series: pd.Series, length: int, ma_type: str) -> pd.Series:
 
 
 def compute_macd(close: pd.Series, fast: int, slow: int, sig_len: int) -> pd.DataFrame:
-    """Считает MACD. Принимает только close-серию, возвращает DataFrame с 3 колонками."""
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -301,10 +292,6 @@ def hist_color(hist: float, hist_prev: float) -> str:
 
 
 def check_ema_condition(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
-    """
-    Проверяет ТОЛЬКО EMA-условие: close[prev] >= maHigh[prev] и close[curr] < maHigh[curr].
-    Если условия нет — возвращает None (MACD даже не считаем).
-    """
     if len(df) < length + 5:
         return None
 
@@ -336,11 +323,6 @@ def check_ema_condition(df: pd.DataFrame, length: int, ma_type: str) -> dict | N
 
 def check_macd_condition(df: pd.DataFrame,
                          fast: int, slow: int, sig_len: int) -> dict | None:
-    """
-    Проверяет ТОЛЬКО MACD-условие:
-      signal < 0  И  смена dark_red -> light_red.
-    Вызывается уже ПОСЛЕ выполнения EMA-условия.
-    """
     min_bars = slow + sig_len + 5
     if len(df) < min_bars:
         return None
@@ -355,11 +337,9 @@ def check_macd_condition(df: pd.DataFrame,
     if pd.isna(curr_hist) or pd.isna(prev_hist) or pd.isna(before_hist) or pd.isna(curr_signal):
         return None
 
-    # 1) signal < 0
     if not (curr_signal < 0):
         return None
 
-    # 2) dark_red -> light_red
     c_curr = hist_color(curr_hist, prev_hist)
     c_prev = hist_color(prev_hist, before_hist)
     if not (c_prev == "dark_red" and c_curr == "light_red"):
@@ -395,9 +375,8 @@ def send_email(subject: str, body: str, smtp_host: str, smtp_port: int) -> None:
 
 # ---------- Обработка одного тикера ----------
 
-def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
+def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
                    state: dict, signals: list) -> None:
-    suffix = cfg.get("instrument_suffix", "-USDT-SWAP")
     ma_type = cfg.get("ema_type", "EMA")
     warmup_factor = int(cfg.get("warmup_factor", 3))
     macd_cfg = cfg.get("macd", {})
@@ -407,40 +386,37 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
 
     bar = TF_TO_OKX_BAR.get(tf)
     if not bar:
-        dbg(f"  [{ticker} {tf}] Неизвестный ТФ — пропуск.")
+        dbg(f"  [{inst_id} {tf}] Неизвестный ТФ — пропуск.")
         return
 
-    inst_id = to_okx_inst(ticker, suffix)
     needed = max(ema_length, macd_slow + macd_sig) * warmup_factor
     cache_key = f"candles_{inst_id}_{tf}"
 
-    dbg(f"  [{ticker} {tf}] inst={inst_id}, EMA={ema_length}, "
+    dbg(f"  [{inst_id} {tf}] EMA={ema_length}, "
         f"MACD={macd_fast}/{macd_slow}/{macd_sig}, нужно ~{needed}")
 
     try:
         df = update_cache(inst_id, bar, cache_key, state, needed)
     except Exception as e:
-        log(f"  [{ticker} {tf}] Ошибка загрузки: {e}")
+        log(f"  [{inst_id} {tf}] Ошибка загрузки: {e}")
         return
 
-    # Шаг 1: EMA-условие. Если не выполнено — выходим, MACD НЕ считаем.
     ema_sig = check_ema_condition(df, ema_length, ma_type)
     if not ema_sig:
-        dbg(f"  [{ticker} {tf}] EMA-условия нет (MACD не считался).")
+        dbg(f"  [{inst_id} {tf}] EMA-условия нет (MACD не считался).")
         return
 
-    dbg(f"  [{ticker} {tf}] EMA-условие выполнено, проверяю MACD...")
+    dbg(f"  [{inst_id} {tf}] EMA-условие выполнено, проверяю MACD...")
 
-    # Шаг 2: MACD-условие
     macd_sig_data = check_macd_condition(df, macd_fast, macd_slow, macd_sig)
     if not macd_sig_data:
-        dbg(f"  [{ticker} {tf}] EMA есть, MACD-условия нет.")
+        dbg(f"  [{inst_id} {tf}] EMA есть, MACD-условия нет.")
         return
 
     candle_time = ema_sig["candle_time"]
     dedup_key = f"last_signal_candle_{inst_id}_{tf}"
     if state.get(dedup_key) == candle_time:
-        dbg(f"  [{ticker} {tf}] сигнал по свече {candle_time} уже отправлялся.")
+        dbg(f"  [{inst_id} {tf}] сигнал по свече {candle_time} уже отправлялся.")
         return
 
     state[dedup_key] = candle_time
@@ -455,7 +431,7 @@ def process_ticker(ticker: str, tf: str, ema_length: int, cfg: dict,
         "hist": macd_sig_data["hist"],
         "hist_prev": macd_sig_data["hist_prev"],
     })
-    log(f"  [{ticker} {tf}] СИГНАЛ "
+    log(f"  [{inst_id} {tf}] СИГНАЛ "
         f"(close {ema_sig['close']:.6f} < maHigh {ema_sig['maHigh']:.6f}, "
         f"signal {macd_sig_data['macd_signal']:.4f} < 0, "
         f"hist {macd_sig_data['hist_prev']:.6f} -> {macd_sig_data['hist']:.6f})")
@@ -480,13 +456,13 @@ def main() -> None:
     for tf, tf_cfg in timeframes.items():
         ema_length = int(tf_cfg["ema_length"])
         dbg(f"=== ТФ {tf} (EMA {ema_length}) ===")
-        for ticker in tickers:
+        for inst_id in tickers:
             try:
-                process_ticker(ticker, tf, ema_length, cfg, state, signals)
+                process_ticker(inst_id, tf, ema_length, cfg, state, signals)
             except SystemExit:
                 raise
             except Exception as e:
-                log(f"  [{ticker} {tf}] Ошибка: {e}")
+                log(f"  [{inst_id} {tf}] Ошибка: {e}")
 
     save_state(state)
 
