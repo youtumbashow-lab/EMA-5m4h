@@ -6,22 +6,18 @@ EMA High/Low Alert Bot — BTC-USDT-SWAP (5m / 4h) — OKX
 Аналог индикатора "High/Low EMA Area" (Pine v6), но в виде Python-бота.
 
 Логика сигнала:
-  Строим две скользящие (EMA) по close-логике индикатора:
     maLow  = EMA(low,  len)
     maHigh = EMA(high, len)
-  len = 2400 для 5m, 200 для 4h.
+    len = 2400 для 5m, 200 для 4h.
 
-  Сигнал: на ПОСЛЕДНЕЙ ЗАКРЫТОЙ свече произошло пересечение цены вниз
-  через ВЕРХНЮЮ границу (maHigh):
-      close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
+Сигнал: на последней ЗАКРЫТОЙ свече close пересёк maHigh сверху вниз:
+    close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
 
-  То есть именно та ситуация, которую мы ловили в Pine через
-  ta.crossunder(close, maHigh). Алерт приходит после закрытия свечи.
+Запускается внешним триггером (cron-job.org -> workflow_dispatch).
+Дедуп по свече — через state.json (кэшируется между запусками Actions).
 
 Секреты (Settings -> Secrets and variables -> Actions):
   EMAIL_TO, EMAIL_USER, EMAIL_APP_PASSWORD
-
-Источник данных — публичный API OKX (без ключей).
 """
 
 import json
@@ -40,24 +36,20 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "state.json"
 
-# Жёсткая привязка под задачу
 TICKER = "BTC-USDT-SWAP"
-EMA_TYPE = "EMA"  # можно поменять на SMA/WMA/RMA, но по умолчанию EMA
+EMA_TYPE = "EMA"
 
-# Периоды под таймфреймы (как в первом ТЗ)
 TF_LEN = {
     "5m":  2400,
     "4h":  200,
 }
 
-# OKX bar-строки
 TF_TO_OKX_BAR = {
     "5m": "5m",
-    "4h": "4H",   # OKX принимает 4H для 4-часового бара
+    "4h": "4H",
 }
 
-# Сколько свечей тянем. Для 2400 EMA нужен запас.
-CANDLES_LIMIT = 300  # максимум OKX для /market/candles
+CANDLES_LIMIT = 300
 
 
 def log(msg: str) -> None:
@@ -87,7 +79,6 @@ def save_state(state: dict) -> None:
 
 
 def fetch_data(symbol: str, bar: str) -> pd.DataFrame:
-    """Тянет закрытые свечи с OKX и возвращает DataFrame, отсортированный по времени."""
     log(f"Загрузка {symbol} {bar} с OKX...")
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": symbol, "bar": bar, "limit": str(CANDLES_LIMIT)}
@@ -107,7 +98,7 @@ def fetch_data(symbol: str, bar: str) -> pd.DataFrame:
 
     rows = []
     for k in raw:
-        if k[8] != "1":   # только закрытые свечи
+        if k[8] != "1":
             continue
         rows.append({
             "open_time": pd.to_datetime(int(k[0]), unit="ms", utc=True),
@@ -139,11 +130,10 @@ def compute_ma(series: pd.Series, length: int, ma_type: str) -> pd.Series:
     if mt == "SMA":
         return sma(series, length)
     fail(f"Неподдерживаемый тип MA: {ma_type}")
-    return series  # недостижимо
+    return series
 
 
 def check_signal(df: pd.DataFrame, length: int) -> dict | None:
-    """Проверяет пересечение close вниз через верхнюю границу maHigh на последней закрытой свече."""
     if len(df) < 3:
         return None
 
@@ -151,11 +141,9 @@ def check_signal(df: pd.DataFrame, length: int) -> dict | None:
     df["maHigh"] = compute_ma(df["High"], length, EMA_TYPE)
     df["maLow"]  = compute_ma(df["Low"],  length, EMA_TYPE)
 
-    # Последняя закрытая свеча и предыдущая
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Есть NaN (мало данных для SMA) — выходим
     if pd.isna(curr["maHigh"]) or pd.isna(prev["maHigh"]):
         return None
 
@@ -201,11 +189,6 @@ def process_timeframe(tf: str, smtp_host: str, smtp_port: int, state: dict) -> N
         return
 
     df = fetch_data(TICKER, bar)
-
-    # Для EMA(2400) у нас максимум 300 свечей с /market/candles — значит,
-    # EMA посчитается не полностью, а только с момента, откуда пришли данные.
-    # Для долгосрочной EMA(2400) этого мало — см. примечание в README.
-    # Здесь мы честно считаем EMA по доступным данным.
     sig = check_signal(df, length)
     if not sig:
         log(f"[{tf}] Пересечения close ниже maHigh({length}) нет.")
@@ -254,8 +237,6 @@ def main() -> None:
     smtp_port = 465
 
     state = load_state()
-
-    # 5m и 4h проверяем за один прогон.
     for tf in ("5m", "4h"):
         try:
             process_timeframe(tf, smtp_host, smtp_port, state)
