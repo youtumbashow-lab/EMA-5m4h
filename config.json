@@ -25,5 +25,6 @@
     "fast": 12,
     "slow": 26,
     "signal": 9
-  }
+  },
+  "signal_cooldown_min": 60
 }
