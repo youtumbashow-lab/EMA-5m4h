@@ -12,8 +12,7 @@
     "XRP-USDT-SWAP",
     "TRX-USDT-SWAP",
     "DOT-USDT-SWAP",
-    "STRK-USDT-SWAP",
-    "MNT-USDT"
+    "STRK-USDT-SWAP"
   ],
   "timeframes": {
     "5m": { "ema_length": 2400 },
