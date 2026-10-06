@@ -1,0 +1,55 @@
+name: EMA High/Low Alert (BTC-USDT-SWAP 5m / 4h)
+
+on:
+  schedule:
+    # Каждую минуту — чтобы не пропустить момент закрытия 5m-свечи.
+    # Логика отправки внутри скрипта: письмо уходит один раз на закрытую свечу.
+    - cron: "* * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ema-alert-5m4h
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: ema-state-${{ github.run_id }}
+          restore-keys: |
+            ema-state-
+
+      - name: Run bot
+        env:
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python ema_alert_bot.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: ema-state-${{ github.run_id }}
