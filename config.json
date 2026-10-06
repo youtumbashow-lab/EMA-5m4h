@@ -1,26 +1,25 @@
 {
   "tickers": [
-    "BTC-USD",
-    "ETH-USD",
-    "TRUMP-USD",
-    "LTC-USD",
-    "ICP-USD",
-    "DASH-USD",
-    "ETC-USD",
-    "DOGE-USD",
-    "ARB-USD",
-    "XRP-USD",
-    "TRX-USD",
-    "DOT-USD",
-    "STRK-USD",
-    "MNT-USD"
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "TRUMP-USDT-SWAP",
+    "LTC-USDT-SWAP",
+    "ICP-USDT-SWAP",
+    "DASH-USDT-SWAP",
+    "ETC-USDT-SWAP",
+    "DOGE-USDT-SWAP",
+    "ARB-USDT-SWAP",
+    "XRP-USDT-SWAP",
+    "TRX-USDT-SWAP",
+    "DOT-USDT-SWAP",
+    "STRK-USDT-SWAP",
+    "MNT-USDT"
   ],
   "timeframes": {
     "5m": { "ema_length": 2400 },
     "4h": { "ema_length": 200  }
   },
   "ema_type": "EMA",
-  "instrument_suffix": "-USDT-SWAP",
   "warmup_factor": 3,
   "macd": {
     "fast": 12,
