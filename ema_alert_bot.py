@@ -17,7 +17,7 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
 MACD считается ТОЛЬКО если EMA-условие выполнено.
 
 Все параметры — в config.json:
-  - tickers       : полные OKX-инструменты (BTC-USDT-SWAP)
+  - tickers       : полные OKX-инструменты (XRP-USDT-SWAP)
   - timeframes    : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
   - ema_type      : EMA | SMA
   - warmup_factor : множитель запаса свечей
@@ -28,7 +28,7 @@ MACD считается ТОЛЬКО если EMA-условие выполне�
      и повторяем весь цикл ОДИН раз.
   2) Retry OKX-запросов: 3 попытки с паузами 1s/2s/4s.
   3) Проверка тикеров через /public/instruments при старте.
-  7) HTML-письмо (multipart/alternative) со ссылками на TradingView.
+  7) HTML-письмо (multipart/alternative). Ссылки в TradingView идут на Bybit.
 
 Кэш свечей — в state.json, обрезается до KEEP_CANDLES последних свечей.
 
@@ -380,9 +380,15 @@ def check_macd_condition(df: pd.DataFrame,
 # ---------- Email (HTML) ----------
 
 def _tv_url(inst_id: str, tf: str) -> str:
+    """
+    OKX-инструмент -> TradingView-символ для Bybit.
+    XRP-USDT-SWAP  -> BYBIT:XRPUSDT.P
+    DOT-USDT-SWAP  -> BYBIT:DOTUSDT.P
+    BTC-USDT       -> BYBIT:BTCUSDT
+    """
     base = inst_id.replace("-SWAP", "").replace("-", "")
     is_swap = inst_id.endswith("-SWAP")
-    tv_sym = f"OKX:{base}.P" if is_swap else f"OKX:{base}"
+    tv_sym = f"BYBIT:{base}.P" if is_swap else f"BYBIT:{base}"
     tv_tf = TF_TO_TV.get(tf, "240")
     return f"https://www.tradingview.com/chart/?symbol={tv_sym}&interval={tv_tf}"
 
@@ -422,7 +428,7 @@ def build_html_body(signals: list, now_utc: str) -> str:
       </tbody>
     </table>
     <div style="margin-top:20px;padding-top:14px;border-top:1px solid #eee;color:#586069;font-size:12px;">
-      EMA+MACD Alert Bot (OKX / GitHub Actions). Ссылки ведут в TradingView.
+      EMA+MACD Alert Bot (OKX / GitHub Actions). Ссылки ведут в TradingView (Bybit).
     </div>
   </div>
 </body>
@@ -639,4 +645,4 @@ if __name__ == "__main__":
         raise
     except Exception as e:
         log(f"Непредвиденная ошибка: {e}")
-        sys.exit(1)
+        sys.exit(1) 
