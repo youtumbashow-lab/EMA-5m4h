@@ -16,6 +16,10 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
 
 MACD считается ТОЛЬКО если EMA-условие выполнено.
 
+В письме:
+  - топ-5 сигналов по "силе" (signal(9) самый отрицательный = самый сильный)
+  - остальные — строкой "и ещё N: ..." в футере
+
 Все параметры — в config.json:
   - tickers       : полные OKX-инструменты (XRP-USDT-SWAP)
   - timeframes    : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
@@ -29,11 +33,12 @@ MACD считается ТОЛЬКО если EMA-условие выполне�
   2) Retry OKX-запросов: 3 попытки с паузами 1s/2s/4s.
   3) Проверка тикеров через /public/instruments при старте.
   7) HTML-письмо (multipart/alternative). Ссылки в TradingView идут на Bybit.
+  8) Топ-5 по силе + остальные строкой.
 
 Кэш свечей — в state.json, обрезается до KEEP_CANDLES последних свечей.
 
 Тема письма: LONG [EMA+MACD] 5m/4h — сигналов: N
-В письме только 2 колонки: Инструмент, ТФ.
+В письме 2 колонки: Инструмент, ТФ.
 
 Секреты (Settings -> Secrets and variables -> Actions):
   EMAIL_TO, EMAIL_USER, EMAIL_APP_PASSWORD
@@ -66,6 +71,9 @@ KEEP_CANDLES = 5000
 RETRY_DELAY_SEC = 20
 HTTP_RETRIES = 3
 HTTP_BACKOFF = (1, 2, 4)
+
+# Сколько сигналов показывать в таблице. Остальные — строкой в футере.
+TOP_N = 5
 
 DEBUG = os.environ.get("DEBUG", "").strip() == "1"
 
@@ -393,9 +401,17 @@ def _tv_url(inst_id: str, tf: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol={tv_sym}&interval={tv_tf}"
 
 
+def _sort_signals_by_strength(signals: list) -> list:
+    """Сортирует по силе: signal(9) самый отрицательный — первым."""
+    return sorted(signals, key=lambda s: s["macd_signal"])
+
+
 def build_html_body(signals: list, now_utc: str) -> str:
+    top = _sort_signals_by_strength(signals)[:TOP_N]
+    rest = _sort_signals_by_strength(signals)[TOP_N:]
+
     rows = []
-    for s in signals:
+    for s in top:
         tv = _tv_url(s["inst_id"], s["tf"])
         rows.append(f"""
         <tr>
@@ -408,6 +424,20 @@ def build_html_body(signals: list, now_utc: str) -> str:
             {s['tf']}
           </td>
         </tr>""")
+
+    # Строка «и ещё N: ...» с тикерами (без ссылок, без ТФ, компактно)
+    rest_line = ""
+    if rest:
+        rest_items = " · ".join(
+            f"{s['inst_id'].replace('-USDT-SWAP', '').replace('-USDT', '')} ({s['tf']})"
+            for s in rest
+        )
+        rest_line = (
+            f'<div style="margin-top:16px;padding-top:12px;'
+            f'border-top:1px solid #eee;color:#586069;font-size:13px;">'
+            f'и ещё {len(rest)}: {rest_items}'
+            f'</div>'
+        )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -427,7 +457,8 @@ def build_html_body(signals: list, now_utc: str) -> str:
         {''.join(rows)}
       </tbody>
     </table>
-    <div style="margin-top:20px;padding-top:14px;border-top:1px solid #eee;color:#586069;font-size:12px;">
+    {rest_line}
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid #eee;color:#586069;font-size:12px;">
       EMA+MACD Alert Bot (OKX / GitHub Actions). Ссылки ведут в TradingView (Bybit).
     </div>
   </div>
@@ -436,9 +467,21 @@ def build_html_body(signals: list, now_utc: str) -> str:
 
 
 def build_text_body(signals: list, now_utc: str) -> str:
-    lines = [f"LONG [EMA+MACD] — {now_utc}", ""]
-    for i, s in enumerate(signals, 1):
+    top = _sort_signals_by_strength(signals)[:TOP_N]
+    rest = _sort_signals_by_strength(signals)[TOP_N:]
+
+    lines = [f"LONG [EMA+MACD] — {now_utc} · всего: {len(signals)}", ""]
+    for i, s in enumerate(top, 1):
         lines.append(f"{i}. {s['inst_id']} ({s['tf']})")
+
+    if rest:
+        rest_items = ", ".join(
+            f"{s['inst_id'].replace('-USDT-SWAP', '').replace('-USDT', '')} ({s['tf']})"
+            for s in rest
+        )
+        lines.append("")
+        lines.append(f"и ещё {len(rest)}: {rest_items}")
+
     lines.append("")
     lines.append("— EMA+MACD Alert Bot (OKX / GitHub Actions)")
     return "\n".join(lines)
@@ -645,4 +688,4 @@ if __name__ == "__main__":
         raise
     except Exception as e:
         log(f"Непредвиденная ошибка: {e}")
-        sys.exit(1) 
+        sys.exit(1)
