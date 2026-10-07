@@ -674,4 +674,185 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
 
     confirm_tf = CONFIRM_TF.get(tf)
     if confirm_tf:
-        higher_signal = get_macd_signal_from
+        higher_signal = get_macd_signal_from_cache(
+            state, inst_id, confirm_tf, macd_fast, macd_slow, macd_sig
+        )
+        if higher_signal is None:
+            dbg(f"  [{inst_id} {tf}] нет данных {confirm_tf} для подтверждения — пропуск.")
+            return fresh_added
+        if not (higher_signal < 0):
+            dbg(f"  [{inst_id} {tf}] {confirm_tf} signal {higher_signal:.4f} >= 0 — пропуск.")
+            return fresh_added
+        dbg(f"  [{inst_id} {tf}] {confirm_tf} signal {higher_signal:.4f} < 0 — OK.")
+
+    dedup_key = f"last_signal_candle_{inst_id}_{tf}"
+    if state.get(dedup_key) == candle_time:
+        dbg(f"  [{inst_id} {tf}] сигнал по свече {candle_time} уже отправлялся.")
+        return fresh_added
+
+    state[dedup_key] = candle_time
+    append_signal_log(state, inst_id, tf, candle_time)
+    signals.append({
+        "inst_id": inst_id,
+        "tf": tf,
+        "ema_length": ema_length,
+        "candle_time": candle_time,
+        "close": close_now,
+        "maMid": ma_mid,
+        "macd_signal": macd_sig_data["macd_signal"],
+        "hist": macd_sig_data["hist"],
+        "hist_prev": macd_sig_data["hist_prev"],
+    })
+    log(f"  [{inst_id} {tf}] СИГНАЛ "
+        f"(close {close_now:.6f} < maMid {ma_mid:.6f}, "
+        f"signal {macd_sig_data['macd_signal']:.4f} < 0, "
+        f"hist {macd_sig_data['hist_prev']:.6f} -> {macd_sig_data['hist']:.6f})")
+    return fresh_added
+
+
+# ---------- Прогон ----------
+
+def run_pass(tickers: list, timeframes: dict, cfg: dict, state: dict) -> tuple[list, bool]:
+    confirm_tfs = set(CONFIRM_TF.values())
+    ordered_tfs = (
+        [tf for tf in timeframes if tf in confirm_tfs]
+        + [tf for tf in timeframes if tf not in confirm_tfs]
+    )
+
+    signals: list = []
+    any_fresh = False
+
+    for tf in ordered_tfs:
+        tf_cfg = timeframes[tf]
+        ema_length = int(tf_cfg["ema_length"])
+        dbg(f"=== ТФ {tf} (EMA {ema_length}) ===")
+        for inst_id in tickers:
+            try:
+                fresh = process_ticker(inst_id, tf, ema_length, cfg, state, signals)
+                if fresh:
+                    any_fresh = True
+            except SystemExit:
+                raise
+            except Exception as e:
+                log(f"  [{inst_id} {tf}] Ошибка: {e}")
+
+    return signals, any_fresh
+
+
+# ---------- Режимы ----------
+
+def run_alerts(cfg: dict, tickers: list, timeframes: dict,
+               smtp_host: str, smtp_port: int) -> None:
+    state = load_state()
+
+    signals, any_fresh = run_pass(tickers, timeframes, cfg, state)
+
+    if not any_fresh:
+        log(f"Новых свечей нет ни по одной паре — retry через {RETRY_DELAY_SEC} сек...")
+        time.sleep(RETRY_DELAY_SEC)
+        signals2, _ = run_pass(tickers, timeframes, cfg, state)
+        seen = {(s["inst_id"], s["tf"], s["candle_time"]) for s in signals}
+        for s in signals2:
+            key = (s["inst_id"], s["tf"], s["candle_time"])
+            if key not in seen:
+                signals.append(s)
+                seen.add(key)
+
+    save_state(state)
+
+    if not signals:
+        log("Сигналов нет — письмо не отправляется.")
+        log("Готово.")
+        return
+
+    log(f"СИГНАЛОВ: {len(signals)} — отправляю одно письмо.")
+
+    subject = f"LONG [EMA+MACD] 5m/4h — сигналов: {len(signals)}"
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    text_body = build_text_body(signals, now_utc)
+    html_body = build_html_body(signals, now_utc)
+
+    email_to = os.environ.get("EMAIL_TO", "").strip()
+    try:
+        send_email(subject, text_body, html_body, email_to, smtp_host, smtp_port)
+    except Exception as e:
+        fail(f"Не удалось отправить email: {e}")
+
+    log(f"EMAIL ОТПРАВЛЕН: {subject}")
+    log("Готово.")
+
+
+def run_weekly_report(cfg: dict, tickers: list,
+                      smtp_host: str, smtp_port: int) -> None:
+    state = load_state()
+    log_list = state.get("signal_log", [])
+    log(f"Записей в журнале сигналов: {len(log_list)}")
+
+    wr_cfg = cfg.get("weekly_report", {})
+    days = int(wr_cfg.get("days_back", 7))
+    to_addr = str(wr_cfg.get("to", "")).strip() or os.environ.get("EMAIL_TO", "").strip()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    stats: dict[str, int] = {}
+    for entry in log_list:
+        try:
+            ts = datetime.fromisoformat(entry.get("recorded_at", ""))
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        key = f"{entry.get('inst_id')}|{entry.get('tf')}"
+        stats[key] = stats.get(key, 0) + 1
+
+    timeframes = list(cfg["timeframes"].keys())
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    subject = f"Weekly [EMA+MACD] — {days} дн."
+    text_body = build_weekly_text(stats, days, now_utc, tickers, timeframes)
+    html_body = build_weekly_html(stats, days, now_utc, tickers, timeframes)
+
+    try:
+        send_email(subject, text_body, html_body, to_addr, smtp_host, smtp_port)
+    except Exception as e:
+        fail(f"Не удалось отправить weekly report: {e}")
+
+    log(f"WEEKLY REPORT ОТПРАВЛЕН на {to_addr}")
+    log("Готово.")
+
+
+# ---------- main ----------
+
+def main() -> None:
+    smtp_host = "smtp.gmail.com"
+    smtp_port = 465
+
+    cfg = load_config()
+    tickers = cfg["tickers"]
+
+    if MODE == "weekly_report":
+        log(f"РЕЖИМ: weekly_report | Тикеров: {len(tickers)} | "
+            f"ТФ: {list(cfg['timeframes'].keys())}")
+        run_weekly_report(cfg, tickers, smtp_host, smtp_port)
+        return
+
+    # MODE = alerts
+    timeframes = cfg["timeframes"]
+    log(f"РЕЖИМ: alerts | Тикеров: {len(tickers)} | ТФ: {list(timeframes.keys())}"
+        + ("" if DEBUG else " (DEBUG=1 для подробного лога)"))
+
+    tickers = validate_tickers(tickers)
+    if not tickers:
+        fail("Ни одного валидного тикера — нечего обрабатывать.")
+
+    run_alerts(cfg, tickers, timeframes, smtp_host, smtp_port)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        log(f"Непредвиденная ошибка: {e}")
+        sys.exit(1)
