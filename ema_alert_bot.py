@@ -7,21 +7,15 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
 
 Сигнал на последней ЗАКРЫТОЙ свече при ОДНОВРЕМЕННОМ выполнении:
   EMA:   close[curr] < maMid[curr]
-         где maMid = (MA(high, len) + MA(low, len)) / 2
   MACD1: signal(9) < 0
-  MACD2: смена тёмно-красной -> светло-красной гистограммы
-  ДОП:   для 5m сигнала — signal(9) на 4h тоже < 0 (подтверждение старшим ТФ)
+  MACD2: hist: dark_red -> light_red
+  ДОП:   для 5m — signal(9) на 4h тоже < 0
 
-В письме:
-  - топ-5 сигналов по "силе" (signal(9) самый отрицательный = самый сильный)
-  - остальные — строкой "и ещё N: ..." в футере
+Режимы (переменная окружения MODE):
+  - "alerts" (по умолчанию) — проверка сигналов, письмо при срабатывании.
+  - "weekly_report"          — статистика за последние N дней, одно письмо.
 
-Все параметры — в config.json:
-  - tickers       : полные OKX-инструменты (XRP-USDT-SWAP)
-  - timeframes    : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
-  - ema_type      : EMA | SMA
-  - warmup_factor : множитель запаса свечей
-  - macd.fast/slow/signal
+Журнал сигналов хранится в state.json (signal_log) и чистится до 30 дней.
 
 Секреты (Settings -> Secrets and variables -> Actions):
   EMAIL_TO, EMAIL_USER, EMAIL_APP_PASSWORD
@@ -33,7 +27,7 @@ import smtplib
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -55,30 +49,21 @@ RETRY_DELAY_SEC = 20
 HTTP_RETRIES = 3
 HTTP_BACKOFF = (1, 2, 4)
 
-# Сколько сигналов показывать в таблице. Остальные — строкой в футере.
 TOP_N = 5
 
-# Для каких ТФ требуем подтверждения со старшего ТФ (signal < 0).
-# 5m -> подтверждение с 4h.
 CONFIRM_TF = {
     "5m": "4h",
 }
 
+SIGNAL_LOG_KEEP_DAYS = 30
+
 DEBUG = os.environ.get("DEBUG", "").strip() == "1"
+MODE = os.environ.get("MODE", "alerts").strip() or "alerts"
 
 TF_TO_OKX_BAR = {
-    "1m":  "1m",
-    "3m":  "3m",
-    "5m":  "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h":  "1H",
-    "2h":  "2H",
-    "4h":  "4H",
-    "6h":  "6H",
-    "12h": "12H",
-    "1d":  "1D",
-    "1w":  "1W",
+    "1m":  "1m",  "3m": "3m",  "5m": "5m",  "15m": "15m", "30m": "30m",
+    "1h": "1H",   "2h": "2H",  "4h": "4H",  "6h": "6H",   "12h": "12H",
+    "1d": "1D",   "1w": "1W",
 }
 
 TF_TO_TV = {
@@ -113,6 +98,7 @@ def load_config() -> dict:
     if not cfg.get("timeframes"):
         fail("В config.json пустой объект timeframes")
     cfg.setdefault("macd", {"fast": 12, "slow": 26, "signal": 9})
+    cfg.setdefault("weekly_report", {})
     return cfg
 
 
@@ -376,10 +362,6 @@ def check_macd_condition(df: pd.DataFrame,
 
 def get_macd_signal_from_cache(state: dict, inst_id: str, tf: str,
                                fast: int, slow: int, sig_len: int) -> float | None:
-    """
-    Достаёт signal(9) последней закрытой свечи из кэша state.json
-    для пары (inst_id, tf). Возвращает float или None, если данных нет.
-    """
     cache_key = f"candles_{inst_id}_{tf}"
     cache = load_cache_from_state(state, cache_key)
     if not cache:
@@ -394,7 +376,29 @@ def get_macd_signal_from_cache(state: dict, inst_id: str, tf: str,
     return float(val)
 
 
-# ---------- Email (HTML) ----------
+# ---------- Журнал сигналов ----------
+
+def append_signal_log(state: dict, inst_id: str, tf: str, candle_time: str) -> None:
+    log_list = state.setdefault("signal_log", [])
+    log_list.append({
+        "inst_id": inst_id,
+        "tf": tf,
+        "candle_time": candle_time,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    })
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SIGNAL_LOG_KEEP_DAYS)
+    cleaned = []
+    for entry in log_list:
+        try:
+            ts = datetime.fromisoformat(entry.get("recorded_at", ""))
+        except Exception:
+            continue
+        if ts >= cutoff:
+            cleaned.append(entry)
+    state["signal_log"] = cleaned
+
+
+# ---------- Email ----------
 
 def _tv_url(inst_id: str, tf: str) -> str:
     base = inst_id.replace("-SWAP", "").replace("-", "")
@@ -441,30 +445,24 @@ def build_html_body(signals: list, now_utc: str) -> str:
         )
 
     return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
+<html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f6f8fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#24292e;">
   <div style="max-width:600px;margin:20px auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
     <h2 style="margin:0 0 4px 0;font-size:18px;">LONG [EMA+MACD]</h2>
     <div style="color:#586069;font-size:13px;margin-bottom:18px;">{now_utc} · всего: {len(signals)}</div>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
-      <thead>
-        <tr style="background:#f6f8fa;text-align:left;">
-          <th style="padding:10px 12px;">Инструмент</th>
-          <th style="padding:10px 12px;text-align:center;">ТФ</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
+      <thead><tr style="background:#f6f8fa;text-align:left;">
+        <th style="padding:10px 12px;">Инструмент</th>
+        <th style="padding:10px 12px;text-align:center;">ТФ</th>
+      </tr></thead>
+      <tbody>{''.join(rows)}</tbody>
     </table>
     {rest_line}
     <div style="margin-top:16px;padding-top:12px;border-top:1px solid #eee;color:#586069;font-size:12px;">
       EMA+MACD Alert Bot (OKX / GitHub Actions). Ссылки ведут в TradingView (Bybit).
     </div>
   </div>
-</body>
-</html>"""
+</body></html>"""
 
 
 def build_text_body(signals: list, now_utc: str) -> str:
@@ -488,21 +486,115 @@ def build_text_body(signals: list, now_utc: str) -> str:
     return "\n".join(lines)
 
 
+def build_weekly_html(stats: dict, days: int, now_utc: str,
+                      tickers: list, timeframes: list) -> str:
+    rows = []
+    total = 0
+    for t in tickers:
+        cells = []
+        row_total = 0
+        for tf in timeframes:
+            n = stats.get(f"{t}|{tf}", 0)
+            cells.append(
+                f'<td style="padding:6px 10px;border-bottom:1px solid #eee;'
+                f'text-align:center;font-family:monospace;">{n}</td>'
+            )
+            row_total += n
+        total += row_total
+        rows.append(
+            f'<tr>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #eee;font-weight:600;">{t}</td>'
+            f'{"".join(cells)}'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #eee;'
+            f'text-align:center;font-family:monospace;font-weight:700;">{row_total}</td>'
+            f'</tr>'
+        )
+
+    totals_row = []
+    grand = 0
+    for tf in timeframes:
+        col_sum = sum(stats.get(f"{t}|{tf}", 0) for t in tickers)
+        grand += col_sum
+        totals_row.append(
+            f'<td style="padding:6px 10px;border-top:2px solid #ccc;'
+            f'text-align:center;font-family:monospace;font-weight:700;">{col_sum}</td>'
+        )
+
+    header_tf_cells = "".join(
+        f'<th style="padding:8px 10px;text-align:center;">{tf}</th>' for tf in timeframes
+    )
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f6f8fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#24292e;">
+  <div style="max-width:700px;margin:20px auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <h2 style="margin:0 0 4px 0;font-size:18px;">Weekly [EMA+MACD]</h2>
+    <div style="color:#586069;font-size:13px;margin-bottom:18px;">{now_utc} · окно: последние {days} дн. · всего сигналов: {grand}</div>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;">
+      <thead>
+        <tr style="background:#f6f8fa;text-align:left;">
+          <th style="padding:8px 10px;">Инструмент</th>
+          {header_tf_cells}
+          <th style="padding:8px 10px;text-align:center;">Всего</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+        <tr>
+          <td style="padding:8px 10px;border-top:2px solid #ccc;font-weight:700;">ИТОГО</td>
+          {''.join(totals_row)}
+          <td style="padding:8px 10px;border-top:2px solid #ccc;text-align:center;font-family:monospace;font-weight:700;">{grand}</td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid #eee;color:#586069;font-size:12px;">
+      EMA+MACD Alert Bot (OKX / GitHub Actions).
+    </div>
+  </div>
+</body></html>"""
+
+
+def build_weekly_text(stats: dict, days: int, now_utc: str,
+                      tickers: list, timeframes: list) -> str:
+    lines = [f"Weekly [EMA+MACD] — {now_utc} · окно: последние {days} дн.", ""]
+    header = "Инструмент".ljust(22) + "".join(tf.rjust(6) for tf in timeframes) + "  Всего"
+    lines.append(header)
+    lines.append("-" * len(header))
+    grand = 0
+    for t in tickers:
+        row_total = 0
+        row = t.ljust(22)
+        for tf in timeframes:
+            n = stats.get(f"{t}|{tf}", 0)
+            row += str(n).rjust(6)
+            row_total += n
+        row += f"  {row_total}"
+        grand += row_total
+        lines.append(row)
+    lines.append("-" * len(header))
+    totals = "".join(
+        str(sum(stats.get(f"{t}|{tf}", 0) for t in tickers)).rjust(6)
+        for tf in timeframes
+    )
+    lines.append("ИТОГО".ljust(22) + totals + f"  {grand}")
+    lines.append("")
+    lines.append("— EMA+MACD Alert Bot (OKX / GitHub Actions)")
+    return "\n".join(lines)
+
+
 def send_email(subject: str, text_body: str, html_body: str,
-               smtp_host: str, smtp_port: int) -> None:
-    email_to   = os.environ.get("EMAIL_TO", "").strip()
+               to_addr: str, smtp_host: str, smtp_port: int) -> None:
     email_user = os.environ.get("EMAIL_USER", "").strip()
     email_pass = os.environ.get("EMAIL_APP_PASSWORD", "").replace(" ", "")
-    missing = [n for n, v in (("EMAIL_TO", email_to),
-                              ("EMAIL_USER", email_user),
-                              ("EMAIL_APP_PASSWORD", email_pass)) if not v]
-    if missing:
-        fail(f"Не заданы секреты: {', '.join(missing)}")
+    if not email_user or not email_pass:
+        fail("Не заданы EMAIL_USER или EMAIL_APP_PASSWORD")
+    if not to_addr:
+        fail("Не задан адрес получателя (EMAIL_TO или weekly_report.to)")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = email_user
-    msg["To"] = email_to
+    msg["To"] = to_addr
 
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -580,139 +672,6 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
         dbg(f"  [{inst_id} {tf}] MACD-условия нет.")
         return fresh_added
 
-    # Доп. условие: подтверждение со старшего ТФ (если настроено)
     confirm_tf = CONFIRM_TF.get(tf)
     if confirm_tf:
-        higher_signal = get_macd_signal_from_cache(
-            state, inst_id, confirm_tf, macd_fast, macd_slow, macd_sig
-        )
-        if higher_signal is None:
-            dbg(f"  [{inst_id} {tf}] нет данных {confirm_tf} для подтверждения — пропуск.")
-            return fresh_added
-        if not (higher_signal < 0):
-            dbg(f"  [{inst_id} {tf}] {confirm_tf} signal {higher_signal:.4f} >= 0 — пропуск.")
-            return fresh_added
-        dbg(f"  [{inst_id} {tf}] {confirm_tf} signal {higher_signal:.4f} < 0 — OK.")
-
-    dedup_key = f"last_signal_candle_{inst_id}_{tf}"
-    if state.get(dedup_key) == candle_time:
-        dbg(f"  [{inst_id} {tf}] сигнал по свече {candle_time} уже отправлялся.")
-        return fresh_added
-
-    state[dedup_key] = candle_time
-    signals.append({
-        "inst_id": inst_id,
-        "tf": tf,
-        "ema_length": ema_length,
-        "candle_time": candle_time,
-        "close": close_now,
-        "maMid": ma_mid,
-        "macd_signal": macd_sig_data["macd_signal"],
-        "hist": macd_sig_data["hist"],
-        "hist_prev": macd_sig_data["hist_prev"],
-    })
-    log(f"  [{inst_id} {tf}] СИГНАЛ "
-        f"(close {close_now:.6f} < maMid {ma_mid:.6f}, "
-        f"signal {macd_sig_data['macd_signal']:.4f} < 0, "
-        f"hist {macd_sig_data['hist_prev']:.6f} -> {macd_sig_data['hist']:.6f})")
-    return fresh_added
-
-
-# ---------- Прогон ----------
-
-def run_pass(tickers: list, timeframes: dict, cfg: dict, state: dict) -> tuple[list, bool]:
-    """
-    Порядок важен: сначала обрабатываем ТФ, которые являются "подтверждающими"
-    для других (4h — для 5m), чтобы к моменту проверки 5m кэш 4h уже был свежим.
-    """
-    # Сначала старшие ТФ (те, что могут быть в CONFIRM_TF.values())
-    confirm_tfs = set(CONFIRM_TF.values())
-    ordered_tfs = (
-        [tf for tf in timeframes if tf in confirm_tfs]
-        + [tf for tf in timeframes if tf not in confirm_tfs]
-    )
-
-    signals: list = []
-    any_fresh = False
-
-    for tf in ordered_tfs:
-        tf_cfg = timeframes[tf]
-        ema_length = int(tf_cfg["ema_length"])
-        dbg(f"=== ТФ {tf} (EMA {ema_length}) ===")
-        for inst_id in tickers:
-            try:
-                fresh = process_ticker(inst_id, tf, ema_length, cfg, state, signals)
-                if fresh:
-                    any_fresh = True
-            except SystemExit:
-                raise
-            except Exception as e:
-                log(f"  [{inst_id} {tf}] Ошибка: {e}")
-
-    return signals, any_fresh
-
-
-# ---------- main ----------
-
-def main() -> None:
-    smtp_host = "smtp.gmail.com"
-    smtp_port = 465
-
-    cfg = load_config()
-    tickers = cfg["tickers"]
-    timeframes = cfg["timeframes"]
-
-    log(f"Тикеров в config: {len(tickers)}, ТФ: {list(timeframes.keys())}"
-        + ("" if DEBUG else " (DEBUG=1 для подробного лога)"))
-
-    tickers = validate_tickers(tickers)
-    if not tickers:
-        fail("Ни одного валидного тикера — нечего обрабатывать.")
-
-    state = load_state()
-
-    signals, any_fresh = run_pass(tickers, timeframes, cfg, state)
-
-    if not any_fresh:
-        log(f"Новых свечей нет ни по одной паре — retry через {RETRY_DELAY_SEC} сек...")
-        time.sleep(RETRY_DELAY_SEC)
-        signals2, _ = run_pass(tickers, timeframes, cfg, state)
-        seen = {(s["inst_id"], s["tf"], s["candle_time"]) for s in signals}
-        for s in signals2:
-            key = (s["inst_id"], s["tf"], s["candle_time"])
-            if key not in seen:
-                signals.append(s)
-                seen.add(key)
-
-    save_state(state)
-
-    if not signals:
-        log("Сигналов нет — письмо не отправляется.")
-        log("Готово.")
-        return
-
-    log(f"СИГНАЛОВ: {len(signals)} — отправляю одно письмо.")
-
-    subject = f"LONG [EMA+MACD] 5m/4h — сигналов: {len(signals)}"
-
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    text_body = build_text_body(signals, now_utc)
-    html_body = build_html_body(signals, now_utc)
-
-    try:
-        send_email(subject, text_body, html_body, smtp_host, smtp_port)
-    except Exception as e:
-        fail(f"Не удалось отправить email: {e}")
-
-    log(f"EMAIL ОТПРАВЛЕН: {subject}")
-    log("Готово.")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as e:
-        log(f"Непредвиденная ошибка: {e}")
-        sys.exit(1)
+        higher_signal = get_macd_signal_from
