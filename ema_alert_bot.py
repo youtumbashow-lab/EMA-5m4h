@@ -6,26 +6,29 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
 Аналог индикатора "High/Low EMA Area" (Pine v6) + MACD-фильтр.
 
 Сигнал на последней ЗАКРЫТОЙ свече при ОДНОВРЕМЕННОМ выполнении:
-  EMA:   close[prev] >= maHigh[prev]  И  close[curr] < maHigh[curr]
+  EMA:   close[curr] < maMid[curr]
+         где maMid = (MA(high, len) + MA(low, len)) / 2
   MACD1: signal(9) < 0
   MACD2: смена тёмно-красной -> светло-красной гистограммы
+         (hist < 0: падение сменилось ростом)
+
+Без stateful-логики (никаких "armed"). Дедуп только по свече, чтобы
+retry-прогон в ту же минуту не отправил письмо дважды.
 
 MACD считается ТОЛЬКО если EMA-условие выполнено.
 
 Все параметры — в config.json:
-  - tickers            : полные OKX-инструменты (BTC-USDT-SWAP)
-  - timeframes         : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
-  - ema_type           : EMA | SMA
-  - warmup_factor      : множитель запаса свечей
+  - tickers       : полные OKX-инструменты (BTC-USDT-SWAP)
+  - timeframes    : { "5m": {"ema_length": 2400}, "4h": {"ema_length": 200} }
+  - ema_type      : EMA | SMA
+  - warmup_factor : множитель запаса свечей
   - macd.fast/slow/signal
-  - signal_cooldown_min: не слать сигнал по одному инструменту чаще, чем раз в N минут
 
 Фичи:
   1) Глобальный retry: если ни одна пара не получила новых свечей — ждём 20 сек
-     и повторяем весь цикл ОДИН раз (вместо per-pair ожидания).
+     и повторяем весь цикл ОДИН раз.
   2) Retry OKX-запросов: 3 попытки с паузами 1s/2s/4s.
-  3) Проверка тикеров через /public/instruments при старте — битые выкидываются.
-  6) Cooldown 60 минут (по умолчанию) на сигнал по паре (instrument, tf).
+  3) Проверка тикеров через /public/instruments при старте.
   7) HTML-письмо с таблицей и ссылками на TradingView.
 
 Кэш свечей — в state.json, обрезается до KEEP_CANDLES последних свечей.
@@ -43,7 +46,7 @@ import smtplib
 import ssl
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -60,9 +63,9 @@ MAX_PAGES = 300
 SLEEP_BETWEEN_PAGES = 0.12
 
 KEEP_CANDLES = 5000
-RETRY_DELAY_SEC = 20          # глобальный retry
-HTTP_RETRIES = 3              # retry OKX HTTP-запросов
-HTTP_BACKOFF = (1, 2, 4)      # паузы между попытками
+RETRY_DELAY_SEC = 20
+HTTP_RETRIES = 3
+HTTP_BACKOFF = (1, 2, 4)
 
 DEBUG = os.environ.get("DEBUG", "").strip() == "1"
 
@@ -81,7 +84,6 @@ TF_TO_OKX_BAR = {
     "1w":  "1W",
 }
 
-# Маппинг ТФ для TradingView (ссылки в письме)
 TF_TO_TV = {
     "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
     "1h": "60", "2h": "120", "4h": "240", "6h": "360",
@@ -114,7 +116,6 @@ def load_config() -> dict:
     if not cfg.get("timeframes"):
         fail("В config.json пустой объект timeframes")
     cfg.setdefault("macd", {"fast": 12, "slow": 26, "signal": 9})
-    cfg.setdefault("signal_cooldown_min", 60)
     return cfg
 
 
@@ -137,7 +138,6 @@ def save_state(state: dict) -> None:
 # ---------- OKX ----------
 
 def _http_get(url: str, params: dict) -> dict:
-    """GET с retry (3 попытки). Возвращает JSON или бросает RuntimeError."""
     last_err = None
     for attempt in range(HTTP_RETRIES):
         try:
@@ -157,20 +157,12 @@ def _http_get(url: str, params: dict) -> dict:
 
 
 def fetch_instruments(inst_type: str) -> set:
-    """
-    Возвращает множество instId для instType (SPOT, SWAP).
-    Используется для валидации тикеров из config.json.
-    """
     url = "https://www.okx.com/api/v5/public/instruments"
     payload = _http_get(url, {"instType": inst_type})
     return {item["instId"] for item in payload.get("data", [])}
 
 
 def validate_tickers(tickers: list) -> list:
-    """
-    Проверяет, какие instId существуют на OKX.
-    Возвращает отфильтрованный список (только существующие).
-    """
     log("Проверка тикеров через /public/instruments...")
     try:
         spot = fetch_instruments("SPOT")
@@ -254,7 +246,6 @@ def load_cache_from_state(state: dict, cache_key: str) -> dict:
 
 
 def full_load(inst_id: str, bar: str, needed: int) -> dict:
-    """Полная загрузка истории для пары (inst_id, bar)."""
     cache: dict[int, dict] = {}
     after_ms: int | None = None
     pages = 0
@@ -334,29 +325,28 @@ def hist_color(hist: float, hist_prev: float) -> str:
     return "dark_red"
 
 
-def check_ema_condition(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
+def check_price_vs_mid(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
+    """
+    Возвращает close и maMid последней закрытой свечи.
+    maMid = (MA(high) + MA(low)) / 2.
+    """
     if len(df) < length + 5:
         return None
 
     df = df.copy()
-    df["maHigh"] = compute_ma(df["High"], length, ma_type)
+    maHigh = compute_ma(df["High"], length, ma_type)
+    maLow  = compute_ma(df["Low"],  length, ma_type)
+    maMid  = (maHigh + maLow) / 2
 
     curr = df.iloc[-1]
-    prev = df.iloc[-2]
 
-    if pd.isna(curr["maHigh"]) or pd.isna(prev["maHigh"]):
-        return None
-
-    crossed_below = (prev["Close"] >= prev["maHigh"]) and (curr["Close"] < curr["maHigh"])
-    if not crossed_below:
+    if pd.isna(curr["Close"]) or pd.isna(maMid.iloc[-1]):
         return None
 
     return {
         "candle_time": str(df.index[-1]),
         "close": float(curr["Close"]),
-        "maHigh": float(curr["maHigh"]),
-        "length": length,
-        "candles_used": len(df),
+        "maMid": float(maMid.iloc[-1]),
     }
 
 
@@ -391,34 +381,9 @@ def check_macd_condition(df: pd.DataFrame,
     }
 
 
-# ---------- Cooldown ----------
-
-def is_in_cooldown(state: dict, inst_id: str, tf: str, cooldown_min: int) -> bool:
-    key = f"cooldown_until_{inst_id}_{tf}"
-    until_str = state.get(key)
-    if not until_str:
-        return False
-    try:
-        until = datetime.fromisoformat(until_str)
-    except Exception:
-        return False
-    return datetime.now(timezone.utc) < until
-
-
-def set_cooldown(state: dict, inst_id: str, tf: str, cooldown_min: int) -> None:
-    key = f"cooldown_until_{inst_id}_{tf}"
-    until = datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
-    state[key] = until.isoformat()
-
-
 # ---------- Email (HTML) ----------
 
 def _tv_url(inst_id: str, tf: str) -> str:
-    """
-    OKX-инструмент -> TradingView-символ.
-    BTC-USDT-SWAP  -> OKX:BTCUSDT.P
-    BTC-USDT       -> OKX:BTCUSDT
-    """
     base = inst_id.replace("-SWAP", "").replace("-", "")
     is_swap = inst_id.endswith("-SWAP")
     tv_sym = f"OKX:{base}.P" if is_swap else f"OKX:{base}"
@@ -505,17 +470,12 @@ def send_email(subject: str, text_body: str, html_body: str,
 
 def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
                    state: dict, signals: list) -> bool:
-    """
-    Возвращает True, если при обработке пары были получены новые свечи
-    (используется для глобального retry).
-    """
     ma_type = cfg.get("ema_type", "EMA")
     warmup_factor = int(cfg.get("warmup_factor", 3))
     macd_cfg = cfg.get("macd", {})
     macd_fast = int(macd_cfg.get("fast", 12))
     macd_slow = int(macd_cfg.get("slow", 26))
     macd_sig  = int(macd_cfg.get("signal", 9))
-    cooldown_min = int(cfg.get("signal_cooldown_min", 60))
 
     bar = TF_TO_OKX_BAR.get(tf)
     if not bar:
@@ -553,43 +513,46 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
 
     df = cache_to_df(cache)
 
-    ema_sig = check_ema_condition(df, ema_length, ma_type)
-    if not ema_sig:
-        dbg(f"  [{inst_id} {tf}] EMA-условия нет (MACD не считался).")
+    pv = check_price_vs_mid(df, ema_length, ma_type)
+    if not pv:
+        dbg(f"  [{inst_id} {tf}] мало данных.")
         return fresh_added
 
-    dbg(f"  [{inst_id} {tf}] EMA-условие выполнено, проверяю MACD...")
+    close_now = pv["close"]
+    ma_mid = pv["maMid"]
+    candle_time = pv["candle_time"]
+
+    if close_now >= ma_mid:
+        dbg(f"  [{inst_id} {tf}] close {close_now:.6f} >= maMid {ma_mid:.6f} — пропуск.")
+        return fresh_added
+
+    dbg(f"  [{inst_id} {tf}] close {close_now:.6f} < maMid {ma_mid:.6f}, проверяю MACD...")
 
     macd_sig_data = check_macd_condition(df, macd_fast, macd_slow, macd_sig)
     if not macd_sig_data:
-        dbg(f"  [{inst_id} {tf}] EMA есть, MACD-условия нет.")
+        dbg(f"  [{inst_id} {tf}] MACD-условия нет.")
         return fresh_added
 
-    candle_time = ema_sig["candle_time"]
+    # Дедуп по свече: только чтобы retry в ту же минуту не отправил дважды
     dedup_key = f"last_signal_candle_{inst_id}_{tf}"
     if state.get(dedup_key) == candle_time:
         dbg(f"  [{inst_id} {tf}] сигнал по свече {candle_time} уже отправлялся.")
         return fresh_added
 
-    if is_in_cooldown(state, inst_id, tf, cooldown_min):
-        dbg(f"  [{inst_id} {tf}] в cooldown ({cooldown_min} мин) — пропуск.")
-        return fresh_added
-
     state[dedup_key] = candle_time
-    set_cooldown(state, inst_id, tf, cooldown_min)
     signals.append({
         "inst_id": inst_id,
         "tf": tf,
         "ema_length": ema_length,
         "candle_time": candle_time,
-        "close": ema_sig["close"],
-        "maHigh": ema_sig["maHigh"],
+        "close": close_now,
+        "maMid": ma_mid,
         "macd_signal": macd_sig_data["macd_signal"],
         "hist": macd_sig_data["hist"],
         "hist_prev": macd_sig_data["hist_prev"],
     })
     log(f"  [{inst_id} {tf}] СИГНАЛ "
-        f"(close {ema_sig['close']:.6f} < maHigh {ema_sig['maHigh']:.6f}, "
+        f"(close {close_now:.6f} < maMid {ma_mid:.6f}, "
         f"signal {macd_sig_data['macd_signal']:.4f} < 0, "
         f"hist {macd_sig_data['hist_prev']:.6f} -> {macd_sig_data['hist']:.6f})")
     return fresh_added
@@ -598,11 +561,6 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
 # ---------- Прогон ----------
 
 def run_pass(tickers: list, timeframes: dict, cfg: dict, state: dict) -> tuple[list, bool]:
-    """
-    Один проход по всем парам.
-    Возвращает (signals, any_fresh) — any_fresh=True, если хотя бы одна пара
-    получила новые свечи.
-    """
     signals: list = []
     any_fresh = False
 
@@ -643,8 +601,6 @@ def main() -> None:
 
     signals, any_fresh = run_pass(tickers, timeframes, cfg, state)
 
-    # Глобальный retry: если ни одна пара не получила новых свечей — ждём
-    # RETRY_DELAY_SEC и повторяем весь проход ОДИН раз.
     if not any_fresh:
         log(f"Новых свечей нет ни по одной паре — retry через {RETRY_DELAY_SEC} сек...")
         time.sleep(RETRY_DELAY_SEC)
