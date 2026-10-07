@@ -10,10 +10,9 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
          где maMid = (MA(high, len) + MA(low, len)) / 2
   MACD1: signal(9) < 0
   MACD2: смена тёмно-красной -> светло-красной гистограммы
-         (hist < 0: падение сменилось ростом)
 
-Без stateful-логики (никаких "armed"). Дедуп только по свече, чтобы
-retry-прогон в ту же минуту не отправил письмо дважды.
+Без stateful-логики. Дедуп только по свече, чтобы retry-прогон в ту же
+минуту не отправил письмо дважды.
 
 MACD считается ТОЛЬКО если EMA-условие выполнено.
 
@@ -29,7 +28,7 @@ MACD считается ТОЛЬКО если EMA-условие выполне�
      и повторяем весь цикл ОДИН раз.
   2) Retry OKX-запросов: 3 попытки с паузами 1s/2s/4s.
   3) Проверка тикеров через /public/instruments при старте.
-  7) HTML-письмо с таблицей и ссылками на TradingView.
+  7) HTML-письмо (multipart/alternative) со ссылками на TradingView.
 
 Кэш свечей — в state.json, обрезается до KEEP_CANDLES последних свечей.
 
@@ -48,6 +47,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from email.header import Header
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -326,10 +326,6 @@ def hist_color(hist: float, hist_prev: float) -> str:
 
 
 def check_price_vs_mid(df: pd.DataFrame, length: int, ma_type: str) -> dict | None:
-    """
-    Возвращает close и maMid последней закрытой свечи.
-    maMid = (MA(high) + MA(low)) / 2.
-    """
     if len(df) < length + 5:
         return None
 
@@ -453,12 +449,13 @@ def send_email(subject: str, text_body: str, html_body: str,
     if missing:
         fail(f"Не заданы секреты: {', '.join(missing)}")
 
-    msg = MIMEText(text_body, "plain", "utf-8")
-    msg.add_alternative(html_body, subtype="html")
-
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = email_user
     msg["To"] = email_to
+
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx) as s:
@@ -533,7 +530,6 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
         dbg(f"  [{inst_id} {tf}] MACD-условия нет.")
         return fresh_added
 
-    # Дедуп по свече: только чтобы retry в ту же минуту не отправил дважды
     dedup_key = f"last_signal_candle_{inst_id}_{tf}"
     if state.get(dedup_key) == candle_time:
         dbg(f"  [{inst_id} {tf}] сигнал по свече {candle_time} уже отправлялся.")
