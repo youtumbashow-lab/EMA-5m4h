@@ -10,11 +10,7 @@ EMA High/Low + MACD Alert Bot — multi-ticker, 5m / 4h — OKX
          где maMid = (MA(high, len) + MA(low, len)) / 2
   MACD1: signal(9) < 0
   MACD2: смена тёмно-красной -> светло-красной гистограммы
-
-Без stateful-логики. Дедуп только по свече, чтобы retry-прогон в ту же
-минуту не отправил письмо дважды.
-
-MACD считается ТОЛЬКО если EMA-условие выполнено.
+  ДОП:   для 5m сигнала — signal(9) на 4h тоже < 0 (подтверждение старшим ТФ)
 
 В письме:
   - топ-5 сигналов по "силе" (signal(9) самый отрицательный = самый сильный)
@@ -26,19 +22,6 @@ MACD считается ТОЛЬКО если EMA-условие выполне�
   - ema_type      : EMA | SMA
   - warmup_factor : множитель запаса свечей
   - macd.fast/slow/signal
-
-Фичи:
-  1) Глобальный retry: если ни одна пара не получила новых свечей — ждём 20 сек
-     и повторяем весь цикл ОДИН раз.
-  2) Retry OKX-запросов: 3 попытки с паузами 1s/2s/4s.
-  3) Проверка тикеров через /public/instruments при старте.
-  7) HTML-письмо (multipart/alternative). Ссылки в TradingView идут на Bybit.
-  8) Топ-5 по силе + остальные строкой.
-
-Кэш свечей — в state.json, обрезается до KEEP_CANDLES последних свечей.
-
-Тема письма: LONG [EMA+MACD] 5m/4h — сигналов: N
-В письме 2 колонки: Инструмент, ТФ.
 
 Секреты (Settings -> Secrets and variables -> Actions):
   EMAIL_TO, EMAIL_USER, EMAIL_APP_PASSWORD
@@ -74,6 +57,12 @@ HTTP_BACKOFF = (1, 2, 4)
 
 # Сколько сигналов показывать в таблице. Остальные — строкой в футере.
 TOP_N = 5
+
+# Для каких ТФ требуем подтверждения со старшего ТФ (signal < 0).
+# 5m -> подтверждение с 4h.
+CONFIRM_TF = {
+    "5m": "4h",
+}
 
 DEBUG = os.environ.get("DEBUG", "").strip() == "1"
 
@@ -385,15 +374,29 @@ def check_macd_condition(df: pd.DataFrame,
     }
 
 
+def get_macd_signal_from_cache(state: dict, inst_id: str, tf: str,
+                               fast: int, slow: int, sig_len: int) -> float | None:
+    """
+    Достаёт signal(9) последней закрытой свечи из кэша state.json
+    для пары (inst_id, tf). Возвращает float или None, если данных нет.
+    """
+    cache_key = f"candles_{inst_id}_{tf}"
+    cache = load_cache_from_state(state, cache_key)
+    if not cache:
+        return None
+    df = cache_to_df(cache)
+    if len(df) < slow + sig_len + 5:
+        return None
+    macd_df = compute_macd(df["Close"], fast, slow, sig_len)
+    val = macd_df["macd_signal"].iloc[-1]
+    if pd.isna(val):
+        return None
+    return float(val)
+
+
 # ---------- Email (HTML) ----------
 
 def _tv_url(inst_id: str, tf: str) -> str:
-    """
-    OKX-инструмент -> TradingView-символ для Bybit.
-    XRP-USDT-SWAP  -> BYBIT:XRPUSDT.P
-    DOT-USDT-SWAP  -> BYBIT:DOTUSDT.P
-    BTC-USDT       -> BYBIT:BTCUSDT
-    """
     base = inst_id.replace("-SWAP", "").replace("-", "")
     is_swap = inst_id.endswith("-SWAP")
     tv_sym = f"BYBIT:{base}.P" if is_swap else f"BYBIT:{base}"
@@ -402,7 +405,6 @@ def _tv_url(inst_id: str, tf: str) -> str:
 
 
 def _sort_signals_by_strength(signals: list) -> list:
-    """Сортирует по силе: signal(9) самый отрицательный — первым."""
     return sorted(signals, key=lambda s: s["macd_signal"])
 
 
@@ -425,7 +427,6 @@ def build_html_body(signals: list, now_utc: str) -> str:
           </td>
         </tr>""")
 
-    # Строка «и ещё N: ...» с тикерами (без ссылок, без ТФ, компактно)
     rest_line = ""
     if rest:
         rest_items = " · ".join(
@@ -579,6 +580,20 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
         dbg(f"  [{inst_id} {tf}] MACD-условия нет.")
         return fresh_added
 
+    # Доп. условие: подтверждение со старшего ТФ (если настроено)
+    confirm_tf = CONFIRM_TF.get(tf)
+    if confirm_tf:
+        higher_signal = get_macd_signal_from_cache(
+            state, inst_id, confirm_tf, macd_fast, macd_slow, macd_sig
+        )
+        if higher_signal is None:
+            dbg(f"  [{inst_id} {tf}] нет данных {confirm_tf} для подтверждения — пропуск.")
+            return fresh_added
+        if not (higher_signal < 0):
+            dbg(f"  [{inst_id} {tf}] {confirm_tf} signal {higher_signal:.4f} >= 0 — пропуск.")
+            return fresh_added
+        dbg(f"  [{inst_id} {tf}] {confirm_tf} signal {higher_signal:.4f} < 0 — OK.")
+
     dedup_key = f"last_signal_candle_{inst_id}_{tf}"
     if state.get(dedup_key) == candle_time:
         dbg(f"  [{inst_id} {tf}] сигнал по свече {candle_time} уже отправлялся.")
@@ -606,10 +621,22 @@ def process_ticker(inst_id: str, tf: str, ema_length: int, cfg: dict,
 # ---------- Прогон ----------
 
 def run_pass(tickers: list, timeframes: dict, cfg: dict, state: dict) -> tuple[list, bool]:
+    """
+    Порядок важен: сначала обрабатываем ТФ, которые являются "подтверждающими"
+    для других (4h — для 5m), чтобы к моменту проверки 5m кэш 4h уже был свежим.
+    """
+    # Сначала старшие ТФ (те, что могут быть в CONFIRM_TF.values())
+    confirm_tfs = set(CONFIRM_TF.values())
+    ordered_tfs = (
+        [tf for tf in timeframes if tf in confirm_tfs]
+        + [tf for tf in timeframes if tf not in confirm_tfs]
+    )
+
     signals: list = []
     any_fresh = False
 
-    for tf, tf_cfg in timeframes.items():
+    for tf in ordered_tfs:
+        tf_cfg = timeframes[tf]
         ema_length = int(tf_cfg["ema_length"])
         dbg(f"=== ТФ {tf} (EMA {ema_length}) ===")
         for inst_id in tickers:
