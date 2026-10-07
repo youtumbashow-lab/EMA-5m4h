@@ -1,17 +1,10 @@
 {
   "tickers": [
     "BTC-USDT-SWAP",
-    "ETH-USDT-SWAP",
     "TRUMP-USDT-SWAP",
-    "LTC-USDT-SWAP",
-    "ICP-USDT-SWAP",
-    "DASH-USDT-SWAP",
-    "ETC-USDT-SWAP",
     "DOGE-USDT-SWAP",
-    "ARB-USDT-SWAP",
-    "XRP-USDT-SWAP",
     "DOT-USDT-SWAP",
-    "STRK-USDT-SWAP"
+    "APT-USDT-SWAP"
   ],
   "timeframes": {
     "5m": { "ema_length": 2400 },
