@@ -1,6 +1,9 @@
 name: EMA High/Low Alert (5m / 4h)
 
 on:
+  # Расписание — на cron-job.org:
+  # POST https://api.github.com/repos/<USER>/<REPO>/actions/workflows/EMA-5m4h.yml/dispatches
+  # Body: {"ref":"main"}
   workflow_dispatch: {}
 
 permissions:
@@ -13,7 +16,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -36,11 +39,12 @@ jobs:
           restore-keys: |
             ema-state-5m4h-
 
-      - name: Run bot
+      - name: Run bot (alerts)
         env:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          MODE: alerts
         run: python ema_alert_bot.py
 
       - name: Save state
