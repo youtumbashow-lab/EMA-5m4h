@@ -5,6 +5,9 @@
     "DOGE-USDT-SWAP",
     "DOT-USDT-SWAP",
     "TRX-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "LTC-USDT-SWAP",
+    "STRK-USDT-SWAP",
     "APT-USDT-SWAP"
   ],
   "timeframes": {
